@@ -6,6 +6,8 @@ import android.os.Looper;
 import android.view.MotionEvent;
 import android.view.ViewConfiguration;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.util.concurrent.ExecutorService;
 
 /** Coordinates Root pointer events, one node lookup, and optional one-shot screenshot capture. */
@@ -14,7 +16,7 @@ final class AccessibilityContentCaptureSource {
 
     private final DragShareAccessibilityService service;
     private final DragShareController controller;
-    private final RootTouchSource rootTouchSource;
+    private final java.util.function.BooleanSupplier rootInputReady;
     private final ExecutorService classifierExecutor;
     private final AccessibilityScreenshotter screenshotter;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -23,12 +25,12 @@ final class AccessibilityContentCaptureSource {
     AccessibilityContentCaptureSource(
             DragShareAccessibilityService service,
             DragShareController controller,
-            RootTouchSource rootTouchSource,
+            java.util.function.BooleanSupplier rootInputReady,
             ExecutorService classifierExecutor,
             AccessibilityScreenshotter screenshotter) {
         this.service = service;
         this.controller = controller;
-        this.rootTouchSource = rootTouchSource;
+        this.rootInputReady = rootInputReady;
         this.classifierExecutor = classifierExecutor;
         this.screenshotter = screenshotter;
         ViewConfiguration configuration = ViewConfiguration.get(service);
@@ -45,8 +47,8 @@ final class AccessibilityContentCaptureSource {
                     @Override
                     public boolean isLongPressAllowed() {
                         return service.isAccessibilityCaptureEnabled()
-                                && rootTouchSource != null
-                                && rootTouchSource.isReady();
+                                && rootInputReady != null
+                                && rootInputReady.getAsBoolean();
                     }
 
                     @Override
@@ -71,6 +73,9 @@ final class AccessibilityContentCaptureSource {
     }
 
     void onPointerEvent(int action, float x, float y, long eventTime) {
+        // The accessibility runtime owns this root stream instead of the portal hooks, so the
+        // controller must be told input is alive or it refuses to paint the overlay.
+        controller.noteRootPointer();
         LongPressGestureDetector.State before = gestureDetector.state();
         gestureDetector.onPointerEvent(action, x, y, eventTime);
         LongPressGestureDetector.State after = gestureDetector.state();
@@ -89,6 +94,8 @@ final class AccessibilityContentCaptureSource {
         screenshotter.cancelAll();
         controller.cancelActiveSession();
     }
+
+    private static final long COMBINED_PORTAL_WINDOW_MS = 1_500L;
 
     private void captureAt(long gestureId, float stableX, float stableY, boolean retried) {
         try {
@@ -119,13 +126,38 @@ final class AccessibilityContentCaptureSource {
                     return;
                 }
                 AccessibilityCandidate candidate = selection.candidate;
+                if (ViewDumpClient.supports(candidate.sourcePackage)) {
+                    // Ask the injected app first: a real ImageView renders to a pure image.
+                    Bitmap pure = ViewDumpClient.request(stableX, stableY);
+                    if (pure != null) {
+                        service.trace("gesture=" + gestureId + " pure image captured size="
+                                + pure.getWidth() + "x" + pure.getHeight());
+                        CapturedContent content = CapturedContent.image(
+                                pure,
+                                candidate.sourcePackage,
+                                candidate.bounds,
+                                true);
+                        postShowIfPortalSilent(gestureId, content);
+                        return;
+                    }
+                    if (!selection.isImage()) {
+                        // Text containers (comment list, "关闭工作表", "up主头像") are not
+                        // draggable content in this app; never crop or copy them.
+                        service.trace("gesture=" + gestureId
+                                + " no ImageView and no image region; skipping");
+                        mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+                        return;
+                    }
+                    // Image region without an ImageView (e.g. the video surface): fall through
+                    // to the accessibility screenshot of that region.
+                }
                 if (!selection.isImage()) {
                     service.trace("gesture=" + gestureId + " text captured");
                     CapturedContent content = CapturedContent.text(
                             candidate.text,
                             candidate.sourcePackage,
                             candidate.bounds);
-                    mainHandler.post(() -> showCapturedContent(gestureId, content));
+                    postShowIfPortalSilent(gestureId, content);
                     return;
                 }
                 screenshotter.capture(gestureId, candidate.bounds, new AccessibilityScreenshotter.Callback() {
@@ -138,7 +170,7 @@ final class AccessibilityContentCaptureSource {
                                 candidate.sourcePackage,
                                 candidate.bounds,
                                 true);
-                        mainHandler.post(() -> showCapturedContent(completedGestureId, content));
+                        postShowIfPortalSilent(completedGestureId, content);
                     }
 
                     @Override
@@ -159,13 +191,44 @@ final class AccessibilityContentCaptureSource {
         }
     }
 
+    /**
+     * Combined mode: the content is captured immediately (so an app's own long-press sheet
+     * cannot end up in the crop) and handed off at once. A duplicate portal pick is rejected
+     * by the portal controller's own "already active" guard, so no extra wait is needed.
+     */
+    private void postShowIfPortalSilent(long gestureId, CapturedContent content) {
+        if (DragShareSettings.readLocal(service).isCombinedCaptureMode()
+                && service.isPortalPickRecent(COMBINED_PORTAL_WINDOW_MS)) {
+            recycleIfOwned(content);
+            DragShareLog.i(TAG, "gesture=" + gestureId
+                    + " portal already active; accessibility content dropped");
+            mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+            return;
+        }
+        mainHandler.post(() -> showCapturedContent(gestureId, content));
+    }
+
     private void showCapturedContent(long gestureId, CapturedContent content) {
-        if (content == null || !service.isAccessibilityCaptureEnabled()
-                || !gestureDetector.beginDragging(gestureId)) {
+        if (content == null || !service.isAccessibilityCaptureEnabled()) {
             recycleIfOwned(content);
             return;
         }
         DragShareSettings settings = DragShareSettings.readLocal(service);
+        if (settings.isCombinedCaptureMode()) {
+            // One overlay only: hand the captured content to the portal process, which owns
+            // the single share window and its own drag tracking. This must not depend on the
+            // local gesture state, because the capture can finish after the finger is lifted.
+            sendToPortal(content, gestureDetector.latestX(), gestureDetector.latestY());
+            recycleIfOwned(content);
+            DragShareLog.i(TAG, "gesture=" + gestureId + " content handed to portal kind="
+                    + content.kind);
+            service.trace("gesture=" + gestureId + " content handed to portal kind=" + content.kind);
+            return;
+        }
+        if (!gestureDetector.beginDragging(gestureId)) {
+            recycleIfOwned(content);
+            return;
+        }
         controller.show(
                 content,
                 gestureDetector.latestX(),
@@ -177,6 +240,29 @@ final class AccessibilityContentCaptureSource {
         controller.onRootDragSessionStarted();
         service.trace("gesture=" + gestureId + " controller show requested kind=" + content.kind);
         DragShareLog.i(TAG, "gesture=" + gestureId + " controller shown kind=" + content.kind);
+    }
+
+    private void sendToPortal(CapturedContent content, float x, float y) {
+        try {
+            android.content.Intent intent = new android.content.Intent(
+                    DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT);
+            intent.setPackage("com.miui.contentextension");
+            intent.putExtra("x", x);
+            intent.putExtra("y", y);
+            if (content.isImage()) {
+                File file = new File(service.getExternalCacheDir(), "acc_content.png");
+                try (FileOutputStream output = new FileOutputStream(file)) {
+                    content.bitmap.compress(Bitmap.CompressFormat.PNG, 100, output);
+                    output.getFD().sync();
+                }
+                intent.putExtra("image_path", file.getAbsolutePath());
+            } else {
+                intent.putExtra("text", content.text);
+            }
+            service.sendBroadcast(intent);
+        } catch (Throwable error) {
+            DragShareLog.w(TAG, "unable to hand content to portal", error);
+        }
     }
 
     private static void recycleIfOwned(CapturedContent content) {

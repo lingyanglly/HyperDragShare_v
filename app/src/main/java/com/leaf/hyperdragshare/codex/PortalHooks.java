@@ -1,9 +1,13 @@
 package com.leaf.hyperdragshare.codex;
 
 import android.annotation.SuppressLint;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.ContentObserver;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.PointF;
 import android.os.Handler;
 import android.os.Looper;
@@ -111,6 +115,7 @@ final class PortalHooks {
                 portalContext = context;
                 portalService = param.thisObject;
                 portalClassLoader = classLoader;
+                registerAccessibilityContentReceiver(context);
                 logPortalVersion(context);
                 DragShareLog.configure(DragShareSettings.readFromProvider(context));
                 DragShareDiagnostics.captureRuntimeOnce(
@@ -216,6 +221,9 @@ final class PortalHooks {
                     if (content == null) {
                         return;
                     }
+                    // Combined mode: tell the accessibility runtime the portal already owns
+                    // this gesture so it does not crop the same long press twice.
+                    notifyPortalPicked(context, content.isImage());
                     PointF point = PortalContentCaptureSource.initialPoint(
                             param.thisObject,
                             current.latestPointerX(),
@@ -231,6 +239,96 @@ final class PortalHooks {
         };
         XposedHelpers.findAndHookMethod(serviceClass, "startPickTextTask", showHook);
         XposedHelpers.findAndHookMethod(serviceClass, "startPickImageTask", showHook);
+    }
+
+    /**
+     * Tells the accessibility runtime (module process) that the portal already produced
+     * content for this gesture. Combined mode uses it to avoid a duplicate screenshot.
+     */
+    private static void notifyPortalPicked(Context context, boolean image) {
+        if (context == null) {
+            return;
+        }
+        try {
+            Intent pick = new Intent(DragShareAccessibilityService.ACTION_PORTAL_PICK);
+            pick.setPackage("com.leaf.hyperdragshare.codex");
+            pick.putExtra(DragShareAccessibilityService.EXTRA_PORTAL_PICK_IMAGE, image);
+            context.sendBroadcast(pick);
+        } catch (Throwable error) {
+            log("unable to notify portal pick", error);
+        }
+    }
+
+    private static volatile BroadcastReceiver accessibilityContentReceiver;
+
+    /** Receives accessibility-captured content so the portal owns the single overlay. */
+    private static void registerAccessibilityContentReceiver(final Context context) {
+        if (accessibilityContentReceiver != null) {
+            return;
+        }
+        try {
+            accessibilityContentReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context receiverContext, Intent intent) {
+                    if (intent != null && DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT
+                            .equals(intent.getAction())) {
+                        handleAccessibilityContent(intent);
+                    }
+                }
+            };
+            IntentFilter filter = new IntentFilter(
+                    DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT);
+            context.registerReceiver(accessibilityContentReceiver, filter,
+                    Context.RECEIVER_EXPORTED);
+            log("accessibility content receiver registered");
+        } catch (Throwable error) {
+            log("unable to register accessibility content receiver", error);
+        }
+    }
+
+    private static void handleAccessibilityContent(Intent intent) {
+        Context context = portalContext;
+        if (context == null) {
+            return;
+        }
+        log("accessibility content received");
+        // The portal never started a pick for this gesture (sticker), so its controller may
+        // not exist yet: build the portal runtime before painting the shared overlay.
+        applyPortalRuntime();
+        DragShareController current = controller;
+        if (current == null) {
+            log("accessibility content dropped: portal controller unavailable");
+            return;
+        }
+        try {
+            float x = intent.getFloatExtra("x", -1f);
+            float y = intent.getFloatExtra("y", -1f);
+            String text = intent.getStringExtra("text");
+            String imagePath = intent.getStringExtra("image_path");
+            CapturedContent content;
+            if (imagePath != null) {
+                byte[] png = readViaRoot(imagePath);
+                Bitmap bitmap = png == null ? null : BitmapFactory.decodeByteArray(png, 0, png.length);
+                if (bitmap == null) {
+                    return;
+                }
+                content = CapturedContent.image(bitmap, null, null, true);
+            } else if (text != null && !text.trim().isEmpty()) {
+                content = CapturedContent.text(text, null, null);
+            } else {
+                return;
+            }
+            DragShareSettings settings = DragShareSettings.readFromProvider(context);
+            current.reservePortalHostFloatWindowSuppression();
+            current.showFromHandoff(content, x, y, settings);
+            log("accessibility content shown through portal kind=" + content.kind);
+        } catch (Throwable error) {
+            log("unable to show accessibility content", error);
+        }
+    }
+
+    private static byte[] readViaRoot(String path) {
+        return RootShell.readFile(path);
     }
 
     private static void hookKnownCallbackClass(ClassLoader classLoader) {
@@ -321,6 +419,7 @@ final class PortalHooks {
                     if (current != null) {
                         current.finishFromControlEvent();
                     }
+
                 }
             } else {
                 // A result without motion and without a control event is pick content.
@@ -594,7 +693,7 @@ final class PortalHooks {
         controlIgnoredLogged = false;
         clearDeferredHostCalls();
         portalRuntimeActive = true;
-        controller = new DragShareController(context, OverlayWindowPolicy.portal());
+        controller = new DragShareController(context, OverlayWindowPolicy.systemHosted());
         controller.prewarmTargets();
         motionSource = new MiuiMotionSource(classLoader, PortalHooks::dispatchMotion);
         motionSource.start();

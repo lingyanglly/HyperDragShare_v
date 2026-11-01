@@ -48,6 +48,9 @@ final class LongPressGestureDetector {
     private float downY;
     private float latestX;
     private float latestY;
+    private float longPressX;
+    private float longPressY;
+    private boolean longPressFired;
 
     LongPressGestureDetector(
             long timeoutMillis,
@@ -88,6 +91,7 @@ final class LongPressGestureDetector {
                 downY = y;
                 latestX = x;
                 latestY = y;
+                longPressFired = false;
                 if (callback != null && callback.isLongPressAllowed()) {
                     state = State.PENDING_LONG_PRESS;
                     scheduler.postDelayed(timeoutRunnable, timeoutMillis);
@@ -102,6 +106,12 @@ final class LongPressGestureDetector {
                         && distanceSquared(x, y, downX, downY) > touchSlop * touchSlop) {
                     scheduler.removeCallbacks(timeoutRunnable);
                     state = State.IGNORED_UNTIL_UP;
+                } else if (state == State.CAPTURING_CONTENT && !longPressFired
+                        && distanceSquared(x, y, longPressX, longPressY) > touchSlop * touchSlop) {
+                    // The long press completed (stationary hold); only begin capturing once the
+                    // finger actually moves again. A stationary hold must never trigger.
+                    longPressFired = true;
+                    callback.onLongPress(gestureId, longPressX, longPressY);
                 } else if (state == State.DRAGGING && callback != null) {
                     callback.onDrag(action, x, y, eventTime);
                 }
@@ -182,7 +192,8 @@ final class LongPressGestureDetector {
             return;
         }
         state = State.CAPTURING_CONTENT;
-        callback.onLongPress(gestureId, latestX, latestY);
+        longPressX = latestX;
+        longPressY = latestY;
     }
 
     private void cancelCurrentLocked() {

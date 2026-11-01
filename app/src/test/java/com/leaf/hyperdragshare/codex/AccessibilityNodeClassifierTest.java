@@ -17,7 +17,7 @@ import java.util.Arrays;
 @Config(manifest = Config.NONE)
 public final class AccessibilityNodeClassifierTest {
     @Test
-    public void textAndImageFollowDocumentedPriority() {
+    public void textAndImagePreferTheMoreSpecificNode() {
         AccessibilityNodeSnapshot text = snapshot(new Rect(0, 0, 200, 100))
                 .className("android.widget.TextView")
                 .text("Hello")
@@ -32,7 +32,27 @@ public final class AccessibilityNodeClassifierTest {
         AccessibilityCandidateSelector.Selection selection = AccessibilityCandidateSelector.select(
                 buckets, 30f, 30f);
         assertNotNull(selection);
-        assertEquals(AccessibilityCandidate.Kind.TEXT, selection.candidate.kind);
+        // The image is the smaller node at this point, so it is the more specific target.
+        assertEquals(AccessibilityCandidate.Kind.IMAGE_REGION, selection.candidate.kind);
+    }
+
+    @Test
+    public void fullScreenTextContainerLosesToTheImageInsideIt() {
+        AccessibilityNodeSnapshot listContainer = snapshot(new Rect(0, 0, 1080, 2400))
+                .className("android.widget.TextView")
+                .text("comment list")
+                .leaf(false)
+                .build();
+        AccessibilityNodeSnapshot image = snapshot(new Rect(600, 900, 900, 1200))
+                .className("android.widget.ImageView")
+                .build();
+        AccessibilityNodeClassifier.Buckets buckets = new AccessibilityNodeClassifier(1f, 1080, 2400)
+                .classify(Arrays.asList(listContainer, image));
+
+        AccessibilityCandidateSelector.Selection selection = AccessibilityCandidateSelector.select(
+                buckets, 700f, 1000f);
+        assertNotNull(selection);
+        assertEquals(AccessibilityCandidate.Kind.IMAGE_REGION, selection.candidate.kind);
     }
 
     @Test

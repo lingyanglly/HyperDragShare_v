@@ -432,3 +432,58 @@ helper 进程被杀后 `START_STICKY` 会自愈，因此“回落”分支难以
   未排空、dataSync FGS 在 targetSdk 35+ 的 BOOT_COMPLETED 限制，均为已知观察项。
 
 单测维持 82 全绿（删除项同步更新测试引用），lint 通过。交付 `hds-1.11.0.apk`。
+
+## 1.15.0 / versionCode 114：预览出现稳定窗
+
+- 【修复】当长按点位本来就落在胶囊（顶部）边界时，预览窗刚出现就被第一帧移动事件重新摆放，
+  造成"刚出来就跳"。新增 `OVERLAY_SETTLE_MS = 800` 的稳定窗：预览出现后 800 ms 内
+  `handlePointerOnMain` 不再重摆预览位置（菜单出现/收起等其它路径仍正常重摆），之后恢复跟手。
+- 【优化】延续 1.14.0 的全局去重：`RootShell` 统一 `su` 调用、`OverlayWindowPolicy` 收敛为
+  单一策略类、`LogUtils` 转发层删除、`PORTAL_NOTHING` 死链删除；B 站 `AppViewHook` 移除"渲染
+  最深 View"的死代码路径。
+- 【测试】单测 83 全绿，`lintDebug` 通过。
+
+交付 `hds-1.15.0.apk`。
+
+## 1.14.0 / versionCode 113：浮窗真正统一 + 全局去重
+
+- 【统一·浮窗】无障碍抓到的内容不再由模块进程开窗，而是广播交给传送门进程，由传送门那**唯一
+  一个浮窗**显示并跟手（`ACTION_ACCESSIBILITY_CONTENT` + `DragShareController.showFromHandoff`）。
+  一次长按无论走哪条链路都只有一个浮窗；模块侧控制器只在"仅无障碍"模式下使用。
+- 【统一·窗口策略】`OverlayWindowPolicy` 收敛为一个类：窗口类型由运行能力决定
+  （`systemHosted()` = `TYPE_SYSTEM_DIALOG`，`accessibilityHosted()` =
+  `TYPE_ACCESSIBILITY_OVERLAY`），原先散落在控制器里的 `"portal"/"accessibility"` 字符串判断
+  改为 `deferUntilMove` / `traceToAccessibility` 两个布尔字段。
+- 【统一·root 调用】新增 `RootShell`（`exec` / `run` / `readFile`），替换 9 处各自拼装的
+  `ProcessBuilder("su", "-c", ...)`（`ViewDumpClient`、`PortalHooks`、`BootReceiver` 已迁移）。
+- 【统一·日志】删除 `LogUtils` 这层无意义转发，直接使用 `DragShareLog`。
+- 【修复】B 站纯图链路：多进程抢答（子进程 `roots=0` 却回答"无图"）→ 只有持有窗口的进程才应答；
+  传送门控制器在贴纸场景下尚未创建 → `handleAccessibilityContent` 先 `applyPortalRuntime()`；
+  抓图耗时导致松手后内容被丢弃 → 移交路径不再依赖本地手势状态；去掉多余的 600 ms 等待。
+- 【规则】B 站内容判定：有真实 `ImageView` → 纯图；没有但节点是图像区域（视频画面）→ 无障碍
+  截图；是文字容器（评论区、`关闭工作表`、`up主头像`）→ 不触发。
+- 【修复】更新安装后自动用 root 重启传送门与 B 站，保证新代码（Hook、接收器）被重新加载。
+- 【测试】单测 83 全绿，`lintDebug` 通过。
+
+交付 `hds-1.14.0.apk`。
+
+## 1.13.0 / versionCode 112：组合模式 + B 站纯图 Hook + 无障碍自动授权
+
+- 【新增】组合内容获取模式（`CONTENT_CAPTURE_COMBINED`）：「传送门 + 无障碍」同时可用，
+  传送门优先；传送门没产出内容时由无障碍接管（长按→节点树→按边界截图）。传送门捕获到
+  内容会广播 `ACTION_PORTAL_PICK`，无障碍在显示前等 320 ms 再检查，避免同一次长按弹出两个浮层。
+- 【新增】B 站纯图 Hook（`AppViewHook`，作用域含 `tv.danmaku.bili`）：模块通过 root 在
+  B 站外部缓存目录写请求（`chmod 666`），注入进程按坐标找到 `ImageView` 用其 `Drawable`
+  渲染 PNG 回传，**透明贴纸不再带出下面的封面层**；找不到 ImageView 时回传"无图"标记，
+  模块立刻回退到无障碍文字/截图。
+- 【新增】无障碍服务由 root 自动授权：`RootInputService` 启动时把自己追加进
+  `enabled_accessibility_services`（保留其他服务），并新增 `MY_PACKAGE_REPLACED` 接收器，
+  更新安装后系统自动关掉的无障碍会被重新打开，用户无需手动操作。
+- 【修复】无障碍运行时复用 `RootInputService` 的 evdev 流（进程内订阅），不再开第二个读取器；
+  无障碍进程补 `noteRootPointer()`，否则 `showOnMain` 会因"无输入帧"跳过浮层。
+- 【修复】候选选择改为「同一点上取更小的节点」，全屏文本容器不再盖住其中的图片；
+  同时更新对应单测（83 个）。
+- 【限制】B 站评论区整块是自绘表面（`FrameLayout` 1200×2608，无独立 ImageView/节点），
+  评论区图片无法精确提取，按用户决定不处理。
+
+交付 `hds-1.13.0.apk`。

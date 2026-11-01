@@ -31,6 +31,18 @@ import java.util.concurrent.Executors;
 /** Accessibility-mode runtime owner. Events only update window state; capture starts after a long press. */
 public final class DragShareAccessibilityService extends AccessibilityService {
     private static final String TAG = "DragShare/Accessibility";
+    /** Broadcast action that dumps the current window tree to logcat for diagnostics. */
+    public static final String ACTION_DIAGNOSTIC_DUMP =
+            "com.leaf.hyperdragshare.codex.DIAGNOSTIC_DUMP";
+    /** Sent by the portal hook when it captured pick content for the current gesture. */
+    public static final String ACTION_PORTAL_PICK =
+            "com.leaf.hyperdragshare.codex.PORTAL_PICK";
+    public static final String EXTRA_PORTAL_PICK_IMAGE = "image";
+    /** Accessibility content handed to the portal process for its single overlay. */
+    public static final String ACTION_ACCESSIBILITY_CONTENT =
+            "com.leaf.hyperdragshare.codex.ACCESSIBILITY_CONTENT";
+    private static final String DIAG_TAG = "DragShare/Diag";
+    private static final int DIAG_MAX_NODES = 800;
     private static final int MAX_NODE_COUNT = 4_000;
     private static final int MAX_NODE_DEPTH = 64;
     private static final long NODE_BUDGET_MILLIS = 120L;
@@ -41,8 +53,16 @@ public final class DragShareAccessibilityService extends AccessibilityService {
     private final Runnable rootReadyReporter = new Runnable() {
         @Override
         public void run() {
+            if (runtimeStarted && !rootInputReused && RootInputService.isRunning()
+                    && (rootTouchSource == null || !rootTouchSource.isReady())) {
+                // The helper came up after the accessibility runtime: move to its stream so
+                // the two readers never compete for the same evdev device.
+                switchToReusedStream();
+            }
             RootTouchSource source = rootTouchSource;
-            boolean ready = runtimeStarted && source != null && source.isReady();
+            boolean ready = runtimeStarted && (rootInputReused
+                    ? RootInputService.isRunning()
+                    : source != null && source.isReady());
             AccessibilityRuntimeStatus.setRootInputReady(ready);
             if (ready != lastReportedRootReady) {
                 lastReportedRootReady = ready;
@@ -79,6 +99,9 @@ public final class DragShareAccessibilityService extends AccessibilityService {
 
     private ContentObserver settingsObserver;
     private BroadcastReceiver screenReceiver;
+    private BroadcastReceiver diagnosticReceiver;
+    private BroadcastReceiver portalPickReceiver;
+    private volatile long lastPortalPickUptime;
     private volatile boolean screenInteractive = true;
     private long rootNotReadySince;
     private int rootRestartCount;
@@ -87,6 +110,8 @@ public final class DragShareAccessibilityService extends AccessibilityService {
     private int runtimeLongPressTimeoutMillis = Integer.MIN_VALUE;
     private int runtimeRecognitionSensitivityPercent = Integer.MIN_VALUE;
     private RootTouchSource rootTouchSource;
+    private RootInputService.PointerListener reusedPointerListener;
+    private volatile boolean rootInputReused;
     private DragShareController controller;
     private AccessibilityContentCaptureSource captureSource;
     private ExecutorService classifierExecutor;
@@ -105,6 +130,8 @@ public final class DragShareAccessibilityService extends AccessibilityService {
                 + " sdk=" + Build.VERSION.SDK_INT);
         registerSettingsObserver();
         registerScreenReceiver();
+        registerDiagnosticReceiver();
+        registerPortalPickReceiver();
         applyMode();
     }
 
@@ -130,6 +157,8 @@ public final class DragShareAccessibilityService extends AccessibilityService {
     public void onDestroy() {
         unregisterSettingsObserver();
         unregisterScreenReceiver();
+        unregisterDiagnosticReceiver();
+        unregisterPortalPickReceiver();
         stopRuntime();
         AccessibilityRuntimeStatus.setConnected(false);
         super.onDestroy();
@@ -227,29 +256,34 @@ public final class DragShareAccessibilityService extends AccessibilityService {
         try {
             controller = new DragShareController(
                     this,
-                    OverlayWindowPolicy.accessibility());
+                    OverlayWindowPolicy.accessibilityHosted());
             screenshotter = new AccessibilityScreenshotter(this, classifierExecutor);
-            rootTouchSource = new RootTouchSource(
-                    getApplicationContext(),
-                    (action, x, y, eventTime) -> {
-                        if (action == android.view.MotionEvent.ACTION_DOWN
-                                || action == android.view.MotionEvent.ACTION_UP
-                                || action == android.view.MotionEvent.ACTION_CANCEL) {
-                            trace("root action=" + android.view.MotionEvent.actionToString(action)
-                                    + " point=" + Math.round(x) + "," + Math.round(y));
-                        }
-                        AccessibilityContentCaptureSource source = captureSource;
-                        if (source != null) {
-                            source.onPointerEvent(action, x, y, eventTime);
-                        }
-                    });
+            // Prefer the helper's already-warm evdev stream: a second RootTouchSource in this
+            // same process competes for the device and leaves the accessibility runtime with
+            // no frames. Fall back to a local reader only when the helper is not running.
+            switchToReusedStream();
+            if (!rootInputReused) {
+                rootTouchSource = new RootTouchSource(
+                        getApplicationContext(),
+                        (action, x, y, eventTime) -> {
+                            traceRootAction(action, x, y);
+                            AccessibilityContentCaptureSource active = captureSource;
+                            if (active != null) {
+                                active.onPointerEvent(action, x, y, eventTime);
+                            }
+                        });
+            }
             captureSource = new AccessibilityContentCaptureSource(
                     this,
                     controller,
-                    rootTouchSource,
+                    () -> rootInputReused
+                            ? RootInputService.isRunning()
+                            : (rootTouchSource != null && rootTouchSource.isReady()),
                     classifierExecutor,
                     screenshotter);
-            rootTouchSource.start();
+            if (rootTouchSource != null) {
+                rootTouchSource.start();
+            }
             mainHandler.removeCallbacks(rootReadyReporter);
             mainHandler.post(rootReadyReporter);
             DragShareLog.i(TAG, "accessibility runtime started");
@@ -260,6 +294,40 @@ public final class DragShareAccessibilityService extends AccessibilityService {
             DragShareLog.w(TAG, "unable to start accessibility runtime", error);
             stopRuntime();
         }
+    }
+
+    private void traceRootAction(int action, float x, float y) {
+        if (action == android.view.MotionEvent.ACTION_DOWN
+                || action == android.view.MotionEvent.ACTION_UP
+                || action == android.view.MotionEvent.ACTION_CANCEL) {
+            trace("root action=" + android.view.MotionEvent.actionToString(action)
+                    + " point=" + Math.round(x) + "," + Math.round(y));
+        }
+    }
+
+    private void switchToReusedStream() {
+        if (rootInputReused) {
+            return;
+        }
+        RootInputService.PointerListener listener = (action, x, y, eventTime) -> {
+            traceRootAction(action, x, y);
+            AccessibilityContentCaptureSource active = captureSource;
+            if (active != null) {
+                active.onPointerEvent(action, x, y, eventTime);
+            }
+        };
+        if (!RootInputService.addPointerListener(listener)) {
+            return;
+        }
+        reusedPointerListener = listener;
+        rootInputReused = true;
+        RootTouchSource local = rootTouchSource;
+        rootTouchSource = null;
+        if (local != null) {
+            local.stop();
+        }
+        DragShareLog.i(TAG, "switched to helper pointer stream");
+        trace("root stream switched to helper");
     }
 
     private void stopRuntime() {
@@ -289,6 +357,12 @@ public final class DragShareAccessibilityService extends AccessibilityService {
         rootTouchSource = null;
         if (input != null) {
             input.stop();
+        }
+        RootInputService.PointerListener reused = reusedPointerListener;
+        reusedPointerListener = null;
+        rootInputReused = false;
+        if (reused != null) {
+            RootInputService.removePointerListener(reused);
         }
         ExecutorService executor = classifierExecutor;
         classifierExecutor = null;
@@ -529,6 +603,183 @@ public final class DragShareAccessibilityService extends AccessibilityService {
             // Already unregistered during platform shutdown.
         }
         screenReceiver = null;
+    }
+
+    private void registerDiagnosticReceiver() {
+        if (diagnosticReceiver != null) {
+            return;
+        }
+        diagnosticReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent != null && ACTION_DIAGNOSTIC_DUMP.equals(intent.getAction())) {
+                    DragShareLog.i(DIAG_TAG, "diagnostic dump requested");
+                    dumpWindowTreeForDiagnostics();
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(ACTION_DIAGNOSTIC_DUMP);
+        try {
+            ContextCompat.registerReceiver(
+                    this,
+                    diagnosticReceiver,
+                    filter,
+                    ContextCompat.RECEIVER_EXPORTED);
+        } catch (Throwable error) {
+            DragShareLog.w(DIAG_TAG, "unable to register diagnostic receiver", error);
+        }
+    }
+
+    private void unregisterDiagnosticReceiver() {
+        if (diagnosticReceiver == null) {
+            return;
+        }
+        try {
+            unregisterReceiver(diagnosticReceiver);
+        } catch (Throwable ignored) {
+            // Already unregistered during platform shutdown.
+        }
+        diagnosticReceiver = null;
+    }
+
+    private void registerPortalPickReceiver() {
+        if (portalPickReceiver != null) {
+            return;
+        }
+        portalPickReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent != null && ACTION_PORTAL_PICK.equals(intent.getAction())) {
+                    lastPortalPickUptime = SystemClock.uptimeMillis();
+                }
+            }
+        };
+        try {
+            ContextCompat.registerReceiver(
+                    this,
+                    portalPickReceiver,
+                    new IntentFilter(ACTION_PORTAL_PICK),
+                    ContextCompat.RECEIVER_EXPORTED);
+        } catch (Throwable error) {
+            DragShareLog.w(TAG, "unable to register portal pick receiver", error);
+        }
+    }
+
+    private void unregisterPortalPickReceiver() {
+        if (portalPickReceiver == null) {
+            return;
+        }
+        try {
+            unregisterReceiver(portalPickReceiver);
+        } catch (Throwable ignored) {
+            // Already unregistered during platform shutdown.
+        }
+        portalPickReceiver = null;
+    }
+
+    /** {@code true} when the portal captured pick content inside the window. */
+    boolean isPortalPickRecent(long windowMillis) {
+        long last = lastPortalPickUptime;
+        return last > 0L && SystemClock.uptimeMillis() - last <= windowMillis;
+    }
+
+    /**
+     * Writes every window and node of the current screen to logcat so a particular control
+     * (custom-canvas stickers, button drawables) can be identified as a node with bounds.
+     * Runs regardless of the capture mode; only reads the tree.
+     */
+    void dumpWindowTreeForDiagnostics() {
+        mainHandler.post(() -> {
+            int[] screen = screenSize();
+            DragShareLog.i(DIAG_TAG, "===== dump start screen="
+                    + screen[0] + "x" + screen[1] + " =====");
+            int[] counter = new int[]{0};
+            List<AccessibilityWindowInfo> windows = null;
+            try {
+                windows = getWindows();
+            } catch (Throwable error) {
+                DragShareLog.w(DIAG_TAG, "getWindows failed", error);
+            }
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    AccessibilityNodeInfo root = null;
+                    try {
+                        if (window == null || window.getType()
+                                == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) {
+                            continue;
+                        }
+                        Rect bounds = new Rect();
+                        window.getBoundsInScreen(bounds);
+                        DragShareLog.i(DIAG_TAG, "window type=" + window.getType()
+                                + " layer=" + window.getLayer()
+                                + " active=" + window.isActive()
+                                + " focused=" + window.isFocused()
+                                + " bounds=" + bounds.flattenToString());
+                        root = window.getRoot();
+                        if (root != null) {
+                            dumpDiagnosticNode(root, 0, counter);
+                        }
+                    } catch (Throwable error) {
+                        DragShareLog.w(DIAG_TAG, "window dump failed", error);
+                    } finally {
+                        recycleNode(root);
+                        recycleWindow(window);
+                    }
+                }
+            }
+            AccessibilityNodeInfo activeRoot = null;
+            try {
+                activeRoot = getRootInActiveWindow();
+                if (activeRoot != null) {
+                    DragShareLog.i(DIAG_TAG, "active window pkg="
+                            + asString(activeRoot.getPackageName()));
+                    dumpDiagnosticNode(activeRoot, 0, counter);
+                }
+            } catch (Throwable error) {
+                DragShareLog.w(DIAG_TAG, "active root dump failed", error);
+            } finally {
+                recycleNode(activeRoot);
+            }
+            DragShareLog.i(DIAG_TAG, "===== dump end nodes=" + counter[0] + " =====");
+        });
+    }
+
+    private void dumpDiagnosticNode(AccessibilityNodeInfo node, int depth, int[] counter) {
+        if (node == null || counter[0] >= DIAG_MAX_NODES) {
+            return;
+        }
+        counter[0]++;
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        DragShareLog.i(DIAG_TAG, "node d=" + depth
+                + " cls=" + asString(node.getClassName())
+                + " b=" + bounds.flattenToString()
+                + " vis=" + node.isVisibleToUser()
+                + " imp=" + node.isImportantForAccessibility()
+                + " clk=" + node.isClickable()
+                + " ed=" + node.isEditable()
+                + " txt=" + truncateText(asString(node.getText()), 40)
+                + " desc=" + truncateText(asString(node.getContentDescription()), 40));
+        int childCount = node.getChildCount();
+        for (int index = 0; index < childCount && counter[0] < DIAG_MAX_NODES; index++) {
+            AccessibilityNodeInfo child = null;
+            try {
+                child = node.getChild(index);
+                dumpDiagnosticNode(child, depth + 1, counter);
+            } catch (Throwable ignored) {
+                // Skip a broken child and keep walking the rest of the tree.
+            } finally {
+                recycleNode(child);
+            }
+        }
+    }
+
+    private static String truncateText(String value, int limit) {
+        if (value == null) {
+            return "null";
+        }
+        String oneLine = value.replace('\n', ' ');
+        return oneLine.length() <= limit ? oneLine : oneLine.substring(0, limit) + "…";
     }
 
     private boolean isScreenInteractive() {

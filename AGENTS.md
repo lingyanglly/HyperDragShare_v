@@ -9,7 +9,7 @@
 ## 工程基线
 
 - 工程类型：Android LSPosed 模块，Java/Kotlin 17，minSdk 33，targetSdk 34，compileSdk 37。
-- 当前版本：`1.11.0`，`versionCode 110`。
+- 当前版本：`1.15.0`，`versionCode 114`。
 - 已验证宿主：传送门 `4.2.1` 与 `5.1.5`（`50015`，Android 17 / HyperOS 4.0），包名
   `com.miui.contentextension`。5.1.5 只完成 DEX 静态符号核对（含
   `observe_control_event` 的 `257`/`258` 字符串），实机注入与拖拽仍须以 logcat 证据为准。
@@ -20,9 +20,10 @@
 
 ## 不可破坏的约束
 
-1. LSPosed 作用域只能包含 `com.miui.contentextension`。不要加入
-   `com.miui.contentcatcher`（Application Extension Service），也不要在部署脚本中强停它；
-   已知部分系统上强停它会连带结束其他应用。
+1. LSPosed 作用域只允许 `com.miui.contentextension` 与用于纯图提取的
+   `tv.danmaku.bili`（`AppViewHook`）。不要加入 `com.miui.contentcatcher`（Application
+   Extension Service），也不要在部署脚本中强停它；已知部分系统上强停它会连带结束其他应用。
+   增加新的目标 App 必须先确认其视图树里存在可取的 `ImageView`。
 2. root 输入源一旦 `isReady()`，它就是一次拖拽的唯一权威输入源。不得把 MIUI
    `MotionEvent`、传送门控制码和 root 事件混在一起决定结束时机。
 3. root 拖拽期间，真实的 `ABS_MT_TRACKING_ID=-1` / `BTN_TOUCH=0` 才对应最终
@@ -69,11 +70,18 @@
 
 ## 代码地图
 
-- `MainHook.java`：限制注入包名。
+- `MainHook.java`：注入包过滤（传送门 + B 站纯图 Hook）。
 - `PortalHooks.java`：安装传送门 Hook、管理生命周期、输入源仲裁和宿主取消信号。
+- `AppViewHook.java`、`ViewDumpClient.java`：注入目标 App 后按坐标找 `ImageView` 并把
+  `Drawable` 渲染成 PNG 回传；模块通过 root 写请求/读响应（外部缓存目录 + chmod 666）。
 - `RootTouchSource.java`、`EvdevTouchParser.java`：发现触摸设备、解析 evdev 多点触控帧，稳定生成 DOWN/MOVE/UP/CANCEL。
 - `MiuiMotionSource.java`：MIUI 系统监听回退。
-- `CapturedContent.java`、`OverlayWindowPolicy.java`：来源无关的文字/图片模型和传送门/无障碍窗口类型。
+- `CapturedContent.java`、`OverlayWindowPolicy.java`：来源无关的文字/图片模型；浮窗策略只有
+  一个类，窗口类型由运行能力决定（系统进程用 `systemHosted()`，模块进程用
+  `accessibilityHosted()`），`deferUntilMove` / `traceToAccessibility` 两个布尔取代了原先散落
+  的 `sourceName` 字符串判断。
+- `RootShell.java`：唯一的 `su` 调用点（`exec` / `run` / `readFile`），所有需要 root 的模块
+  都走这里，不再各自拼 `ProcessBuilder("su", "-c", ...)`。
 - `DragShareController.java`：拖拽会话、悬浮预览、方向菜单、边缘滚动、近手传感器和落点选择；不依赖 Xposed。
 - `PortalGlowView.java`：流光样式的全屏不可触摸光效、下拉进度和托盘展开绘制。
 - `CircleMenuOverlayView.java`、`CircleMenuGeometry.java`：按 JADX MCP 圆菜单类重建的左右贴边半圆样式。
@@ -110,7 +118,7 @@
 .\gradlew.bat testDebugUnitTest lintDebug assembleDebug
 ```
 
-当前应有 82 个单元测试通过，APK 输出到
+当前应有 83 个单元测试通过，APK 输出到
 `app\build\outputs\apk\debug\app-debug.apk`。交付新的可安装行为时同步递增
 `versionCode` 和 `versionName`；纯文档修改不要求增版。
 

@@ -33,8 +33,8 @@ public final class ModernOverlayWindowTest {
     @Test
     public void portalUsesTheVerifiedOpaqueWindowTypeForPublicBackdropBlur() {
         assertEquals(WindowManager.LayoutParams.TYPE_SYSTEM_DIALOG,
-                OverlayWindowPolicy.portal().windowType);
+                OverlayWindowPolicy.systemHosted().windowType);
         assertEquals(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                OverlayWindowPolicy.accessibility().windowType);
+                OverlayWindowPolicy.accessibilityHosted().windowType);
     }
 }

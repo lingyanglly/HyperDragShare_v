@@ -172,6 +172,14 @@ final class DragShareController {
     private float edgeScrollDepth;
     private volatile long lastPointerUptime;
     private boolean sessionGotPointerDown;
+    /** Long-press must be followed by a move before the drag UI takes over. */
+    private volatile boolean gestureMovedSinceDown;
+    private float gestureDownX;
+    private float gestureDownY;
+    private final float gestureMoveSlopPx;
+    private CapturedContent pendingMoveShowPayload;
+    private DragShareSettings pendingMoveShowSettings;
+    private long pendingMoveShowRequestId;
     private static final long SESSION_STALL_TIMEOUT_MS = 1500L;
     private final Runnable stuckSessionCheck = new Runnable() {
         @Override
@@ -186,6 +194,24 @@ final class DragShareController {
             }
         }
     };
+    /** Defense against a race leaving an overlay up after the finger is gone. */
+    private static final long SESSION_HARD_LIMIT_MS = 10_000L;
+    private final Runnable sessionHardLimit = new Runnable() {
+        @Override
+        public void run() {
+            if (active) {
+                log("session exceeded hard limit; force dismissing");
+                cancelGestureOnMain();
+            }
+        }
+    };
+    /** The capsule must not start scrolling options just because the finger happened to be
+     *  outside its edge when it appeared; require a deliberate outward move and a short
+     *  settle window so the first option stays reachable. */
+    private static final long MENU_SCROLL_SETTLE_MS = 800L;
+    private static final int MENU_SCROLL_ARM_SLOP_DP = 24;
+    private long menuShownUptime;
+    private float menuShownX;
     private boolean inputSourceLogged;
     private boolean duplicateStartLogged;
     private boolean backgroundBlockAttempted;
@@ -292,15 +318,16 @@ final class DragShareController {
     private Runnable segmentationClosedListener;
 
     DragShareController(Context context) {
-        this(context, OverlayWindowPolicy.portal());
+        this(context, OverlayWindowPolicy.systemHosted());
     }
 
     DragShareController(Context context, OverlayWindowPolicy windowPolicy) {
         this.context = context;
         this.windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
         this.backgroundTouchBlocker = new BackgroundTouchBlocker(context);
-        this.windowPolicy = windowPolicy == null ? OverlayWindowPolicy.portal() : windowPolicy;
+        this.windowPolicy = windowPolicy == null ? OverlayWindowPolicy.systemHosted() : windowPolicy;
         this.dragShareToast = new DragShareToast(context, this.windowPolicy);
+        this.gestureMoveSlopPx = context.getResources().getDisplayMetrics().density * 24f;
     }
 
     boolean isActive() {
@@ -379,7 +406,39 @@ final class DragShareController {
             return;
         }
         final long requestId = ++showRequestId;
-        runOnMain(() -> showOnMain(content, initialX, initialY, loadedSettings, requestId));
+        runOnMain(() -> {
+            // Portal long presses often collide with an app's own long-press menu. Only
+            // take over once the finger actually moves; a stationary hold is left alone.
+            if (windowPolicy.deferUntilMove && !gestureMovedSinceDown) {
+                pendingMoveShowPayload = content;
+                pendingMoveShowSettings = loadedSettings;
+                pendingMoveShowRequestId = requestId;
+                log("overlay deferred until the finger moves");
+                return;
+            }
+            showOnMain(content, initialX, initialY, loadedSettings, requestId);
+        });
+    }
+
+    /**
+     * Entry point for content captured by the accessibility runtime: that runtime only hands
+     * off mid-gesture after the finger moved, so the portal-side "wait for input / wait for
+     * move" gates must not swallow it.
+     */
+    void showFromHandoff(
+            CapturedContent content,
+            float initialX,
+            float initialY,
+            DragShareSettings loadedSettings) {
+        if (content == null) {
+            return;
+        }
+        final long requestId = ++showRequestId;
+        runOnMain(() -> {
+            rootInputProven = true;
+            gestureMovedSinceDown = true;
+            showOnMain(content, initialX, initialY, loadedSettings, requestId);
+        });
     }
 
     void cancelActiveSession() {
@@ -448,6 +507,23 @@ final class DragShareController {
             sessionGotPointerDown = true;
         }
         mainHandler.post(() -> {
+            trackGestureOnMain(action, x, y);
+            if (pendingMoveShowPayload != null) {
+                if (action == MotionEvent.ACTION_MOVE && gestureMovedSinceDown) {
+                    CapturedContent payload = pendingMoveShowPayload;
+                    DragShareSettings ps = pendingMoveShowSettings;
+                    long pr = pendingMoveShowRequestId;
+                    clearPendingMoveShow();
+                    log("overlay shown after the finger moved");
+                    // Appear directly under the current finger so the triggering move does
+                    // not also yank the freshly created window away from the long-press point.
+                    showOnMain(payload, x, y, ps, pr);
+                } else if (action == MotionEvent.ACTION_UP
+                        || action == MotionEvent.ACTION_CANCEL) {
+                    clearPendingMoveShow();
+                    log("overlay dismissed before the finger moved");
+                }
+            }
             if (active && !inputSourceLogged) {
                 inputSourceLogged = true;
                 log("input source=" + source
@@ -456,6 +532,27 @@ final class DragShareController {
             }
             handleMotionOnMain(action, x, y, eventTime, source, beforeFinish);
         });
+    }
+
+    private void trackGestureOnMain(int action, float x, float y) {
+        if (action == MotionEvent.ACTION_DOWN) {
+            gestureDownX = x;
+            gestureDownY = y;
+            gestureMovedSinceDown = false;
+        } else if (action == MotionEvent.ACTION_MOVE && !gestureMovedSinceDown) {
+            float dx = x - gestureDownX;
+            float dy = y - gestureDownY;
+            if (dx * dx + dy * dy > gestureMoveSlopPx * gestureMoveSlopPx) {
+                gestureMovedSinceDown = true;
+            }
+        }
+    }
+
+    private void clearPendingMoveShow() {
+        pendingMoveShowPayload = null;
+        pendingMoveShowSettings = null;
+        pendingMoveShowRequestId = 0L;
+        pendingPortalHostFloatWindowSuppression = false;
     }
 
     /** Called by a root-backed source after it has created an active drag session. */
@@ -681,6 +778,8 @@ final class DragShareController {
         lastPointerUptime = SystemClock.uptimeMillis();
         mainHandler.removeCallbacks(stuckSessionCheck);
         mainHandler.postDelayed(stuckSessionCheck, SESSION_STALL_TIMEOUT_MS + 200L);
+        mainHandler.removeCallbacks(sessionHardLimit);
+        mainHandler.postDelayed(sessionHardLimit, SESSION_HARD_LIMIT_MS);
 
         if (payload.isImage()) {
             final Session stagedSession = session;
@@ -1416,24 +1515,28 @@ final class DragShareController {
             if (isCapsuleMenu()) {
                 // Horizontal capsule: scroll from the inner bands of the capsule itself,
                 // not from the screen edges (the capsule sits centred, far from them).
-                int slop = dp(SIDE_MENU_SCROLL_LEAVE_SLOP_DP);
-                int innerBand = Math.max(dp(SIDE_MENU_INNER_SCROLL_BAND_DP), 1);
-                float rightInner = menuLeft + menuWidth - innerBand;
-                float leftInner = menuLeft + innerBand;
-                if (x > menuLeft + menuWidth + slop) {
-                    nextDirection = 1;
-                    edgeScrollOutsideMenu = true;
-                    edgeScrollDepth = 1f;
-                } else if (x > rightInner) {
-                    nextDirection = 1;
-                    edgeScrollDepth = Math.min(1f, (x - rightInner) / innerBand);
-                } else if (x < menuLeft - slop) {
-                    nextDirection = -1;
-                    edgeScrollOutsideMenu = true;
-                    edgeScrollDepth = 1f;
-                } else if (x < leftInner) {
-                    nextDirection = -1;
-                    edgeScrollDepth = Math.min(1f, (leftInner - x) / innerBand);
+                // Only once the user deliberately moved away from the point where the menu
+                // appeared; otherwise the first option would scroll away instantly.
+                if (capsuleScrollArmed(x)) {
+                    int slop = dp(SIDE_MENU_SCROLL_LEAVE_SLOP_DP);
+                    int innerBand = Math.max(dp(SIDE_MENU_INNER_SCROLL_BAND_DP), 1);
+                    float rightInner = menuLeft + menuWidth - innerBand;
+                    float leftInner = menuLeft + innerBand;
+                    if (x > menuLeft + menuWidth + slop) {
+                        nextDirection = 1;
+                        edgeScrollOutsideMenu = true;
+                        edgeScrollDepth = 1f;
+                    } else if (x > rightInner) {
+                        nextDirection = 1;
+                        edgeScrollDepth = Math.min(1f, (x - rightInner) / innerBand);
+                    } else if (x < menuLeft - slop) {
+                        nextDirection = -1;
+                        edgeScrollOutsideMenu = true;
+                        edgeScrollDepth = 1f;
+                    } else if (x < leftInner) {
+                        nextDirection = -1;
+                        edgeScrollDepth = Math.min(1f, (leftInner - x) / innerBand);
+                    }
                 }
             } else if (isVerticalSimpleMenu()) {
                 // Dock scrolling starts as soon as the pointer reaches the last visible
@@ -1841,6 +1944,10 @@ final class DragShareController {
         if (menuShown) {
             return;
         }
+        // Anchor the option scrolling to the position the menu appeared at: the finger may
+        // already sit outside the capsule edge, which must not scroll the list by itself.
+        menuShownUptime = SystemClock.uptimeMillis();
+        menuShownX = lastX;
         if (isCircleStyle()) {
             if (circleMenuView == null || circlePendingEdge == CircleMenuGeometry.EDGE_NONE) {
                 return;
@@ -2079,6 +2186,7 @@ final class DragShareController {
 
     private void finishGestureOnMain(boolean allowShare, Runnable afterDeactivate) {
         mainHandler.removeCallbacks(stuckSessionCheck);
+        mainHandler.removeCallbacks(sessionHardLimit);
         if (!active) {
             return;
         }
@@ -2120,6 +2228,7 @@ final class DragShareController {
 
     private void cancelGestureOnMain() {
         mainHandler.removeCallbacks(stuckSessionCheck);
+        mainHandler.removeCallbacks(sessionHardLimit);
         if (!active) {
             return;
         }
@@ -2343,6 +2452,16 @@ final class DragShareController {
             }
         }, "drag-share-local-save");
         worker.start();
+    }
+
+    /** {@code true} once the capsule may scroll its options: the settle window has passed and
+     *  the finger moved away from where it was when the menu appeared. Keeping the first
+     *  option reachable matters more than reacting instantly to the initial position. */
+    private boolean capsuleScrollArmed(float x) {
+        if (SystemClock.uptimeMillis() - menuShownUptime < MENU_SCROLL_SETTLE_MS) {
+            return false;
+        }
+        return Math.abs(x - menuShownX) > dp(MENU_SCROLL_ARM_SLOP_DP);
     }
 
     private void updatePreviewPosition(float x, float y) {
@@ -2973,7 +3092,7 @@ final class DragShareController {
     }
 
     private void traceAccessibility(String message) {
-        if ("accessibility".equals(windowPolicy.sourceName)) {
+        if (windowPolicy.traceToAccessibility) {
             AccessibilityTrace.record(context, message);
         }
     }

@@ -46,6 +46,15 @@ public final class RootInputService extends Service {
     static final String EXTRA_Y = "y";
     static final String EXTRA_TIME = "time";
 
+    /** In-process consumer of the same evdev stream (e.g. the accessibility runtime). */
+    interface PointerListener {
+        void onPointer(int action, float x, float y, long eventTime);
+    }
+
+    private static final java.util.Set<PointerListener> PROCESS_LISTENERS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static volatile boolean running;
+
     private static final String TAG = "DragShare/RootService";
     private static final String CHANNEL_ID = "root_input";
     private static final int NOTIFICATION_ID = 0x5244;
@@ -74,6 +83,10 @@ public final class RootInputService extends Service {
     private static final long REFRESH_OVERRIDE_RESTORE_MS = 2_000L;
     private static final int HEARTBEAT_REQUEST_CODE = 1;
     private static final long HEARTBEAT_INTERVAL_MS = 15 * 60_000L;
+    /** The module's own accessibility service, granted through root so the user never has to. */
+    private static final String ACCESSIBILITY_COMPONENT =
+            "com.leaf.hyperdragshare.codex/"
+                    + "com.leaf.hyperdragshare.codex.DragShareAccessibilityService";
 
     private final List<Messenger> subscribers = new ArrayList<>();
     private final AtomicInteger frames = new AtomicInteger();
@@ -142,6 +155,7 @@ public final class RootInputService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        running = true;
         try {
             startForeground(NOTIFICATION_ID, buildNotification());
         } catch (Throwable error) {
@@ -155,6 +169,51 @@ public final class RootInputService extends Service {
         scheduleHeartbeat();
         probeRefreshSettings();
         warmPortalIfCold();
+        ensureAccessibilityServiceEnabled();
+    }
+
+    /**
+     * Adds this module's accessibility service to the secure setting through root, keeping
+     * the user's other accessibility services intact. Re-running is a no-op, and an update
+     * install (which makes Android drop the service) is repaired on the next app start.
+     */
+    private void ensureAccessibilityServiceEnabled() {
+        Thread thread = new Thread(() -> {
+            String component = ACCESSIBILITY_COMPONENT;
+            String script =
+                    "cur=$(settings get secure enabled_accessibility_services); "
+                            + "case \":$cur:\" in "
+                            + "*\":" + component + ":\"*) ;; "
+                            + "*) if [ -z \"$cur\" ] || [ \"$cur\" = \"null\" ]; then "
+                            + "cur=\"" + component + "\"; "
+                            + "else cur=\"$cur:" + component + "\"; fi ;; "
+                            + "esac; "
+                            + "settings put secure enabled_accessibility_services \"$cur\"; "
+                            + "settings put secure accessibility_enabled 1; echo \"$cur\"";
+            runRootCommand(script, "enable accessibility service");
+        }, "drag-share-enable-accessibility");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /** {@code true} while the helper owns the evdev pipe in this process. */
+    static boolean isRunning() {
+        return running;
+    }
+
+    /** Subscribes an in-process consumer; returns false when the helper is not running. */
+    static boolean addPointerListener(PointerListener listener) {
+        if (!running || listener == null) {
+            return false;
+        }
+        PROCESS_LISTENERS.add(listener);
+        return true;
+    }
+
+    static void removePointerListener(PointerListener listener) {
+        if (listener != null) {
+            PROCESS_LISTENERS.remove(listener);
+        }
     }
 
     /**
@@ -204,7 +263,21 @@ public final class RootInputService extends Service {
             mainHandler.postDelayed(restoreRefreshRunnable, REFRESH_OVERRIDE_RESTORE_MS);
         }
         broadcast(pointerMessage(action, x, y, eventTime));
+        dispatchToProcessListeners(action, x, y, eventTime);
         lastDeliveredAction = action;
+    }
+
+    private static void dispatchToProcessListeners(int action, float x, float y, long eventTime) {
+        if (PROCESS_LISTENERS.isEmpty()) {
+            return;
+        }
+        for (PointerListener listener : PROCESS_LISTENERS) {
+            try {
+                listener.onPointer(action, x, y, eventTime);
+            } catch (Throwable error) {
+                DragShareLog.w(TAG, "in-process pointer listener failed", error);
+            }
+        }
     }
 
     /**
@@ -456,6 +529,8 @@ public final class RootInputService extends Service {
 
     @Override
     public void onDestroy() {
+        running = false;
+        PROCESS_LISTENERS.clear();
         mainHandler.removeCallbacksAndMessages(null);
         if (source != null) {
             source.stop();

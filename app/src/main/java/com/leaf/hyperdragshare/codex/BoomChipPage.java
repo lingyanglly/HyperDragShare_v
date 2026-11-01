@@ -61,7 +61,7 @@ public class BoomChipPage {
             }
             if (restoreSelectedState()) {
                 if (DBG) {
-                    LogUtils.d(TAG, "Skip boom animation when restoring");
+                    DragShareLog.d(TAG, "Skip boom animation when restoring");
                 }
                 return;
             }
@@ -72,7 +72,7 @@ public class BoomChipPage {
             float pageX = getChipParentX();
             float pageY = getChipParentY();
             if (DBG) {
-                LogUtils.d(TAG, "init Chip and do boom animation");
+                DragShareLog.d(TAG, "init Chip and do boom animation");
             }
             final int animationRows = Math.min(mLayout.getRowCount(), 12);
             for (int i = 0; i < animationRows; ++i) {

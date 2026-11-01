@@ -359,21 +359,26 @@ private fun MainPage(
                 Card(modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
                     OverlayDropdownPreference(
                         title = "内容获取方式",
-                        summary = if (settings.isPortalCaptureMode) {
-                            "由传送门识别长按内容"
-                        } else {
-                            "由无障碍读取文字并截取图片区域"
+                        summary = when {
+                            settings.isCombinedCaptureMode ->
+                                "优先由传送门识别；识别不出来时自动改用无障碍"
+                            settings.isPortalCaptureMode ->
+                                "由传送门识别长按内容"
+                            else ->
+                                "由无障碍读取文字并截取图片区域"
                         },
-                        items = listOf("传送门", "无障碍"),
-                        selectedIndex = settings.contentCaptureMode.coerceIn(0, 1),
+                        items = listOf("传送门", "无障碍", "传送门 + 无障碍"),
+                        selectedIndex = settings.contentCaptureMode.coerceIn(0, 2),
                         onSelectedIndexChange = { selected ->
-                            val mode = if (selected == DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY) {
-                                DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY
-                            } else {
-                                DragShareSettings.CONTENT_CAPTURE_PORTAL
+                            val mode = when (selected) {
+                                DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY ->
+                                    DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY
+                                DragShareSettings.CONTENT_CAPTURE_COMBINED ->
+                                    DragShareSettings.CONTENT_CAPTURE_COMBINED
+                                else -> DragShareSettings.CONTENT_CAPTURE_PORTAL
                             }
                             persist(copySettings(settings, contentCaptureMode = mode))
-                            if (mode == DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY
+                            if (mode != DragShareSettings.CONTENT_CAPTURE_PORTAL
                                 && !AccessibilityRuntimeStatus.isServiceEnabled(context)
                             ) {
                                 showAccessibilityDialog = true
@@ -540,16 +545,26 @@ private fun MainPage(
                 }
                 item(key = "simple-appearance-preferences") {
                     Card(modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
+                        val menuPositions = listOf(
+                            DragShareSettings.SIMPLE_MENU_POSITION_BOTTOM,
+                            DragShareSettings.SIMPLE_MENU_POSITION_LEFT,
+                            DragShareSettings.SIMPLE_MENU_POSITION_RIGHT,
+                            DragShareSettings.SIMPLE_MENU_POSITION_NEAR_HAND,
+                            DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES,
+                            DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE,
+                        )
                         OverlayDropdownPreference(
                             title = "菜单位置",
                             summary = "选择分享菜单出现的位置；顶部胶囊贴近状态栏，两侧展开只在左右边缘出现",
-                            items = listOf("上", "下", "左", "右", "近手方向", "两侧展开", "顶部胶囊"),
-                            selectedIndex = settings.simpleMenuPosition.coerceIn(0, 6),
+                            items = listOf("下", "左", "右", "近手方向", "两侧展开", "顶部胶囊"),
+                            selectedIndex = menuPositions.indexOf(settings.simpleMenuPosition)
+                                .coerceAtLeast(0),
                             onSelectedIndexChange = { selected ->
+                                val safe = selected.coerceIn(0, menuPositions.lastIndex)
                                 persist(
                                     copySettings(
                                         settings,
-                                        simpleMenuPosition = selected.coerceIn(0, 6),
+                                        simpleMenuPosition = menuPositions[safe],
                                     ),
                                 )
                             },

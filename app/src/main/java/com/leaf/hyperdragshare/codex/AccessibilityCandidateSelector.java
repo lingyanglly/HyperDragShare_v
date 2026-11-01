@@ -14,19 +14,30 @@ final class AccessibilityCandidateSelector {
         if (hit != null) return new Selection(hit);
         hit = firstContaining(buckets.nativeEditable, x, y);
         if (hit != null) return new Selection(hit);
-        hit = firstContaining(buckets.nativeText, x, y);
-        if (hit != null) return new Selection(hit);
 
-        AccessibilityCandidate webText = firstContaining(buckets.webText, x, y);
-        AccessibilityCandidate webImage = firstContaining(buckets.webNonText, x, y);
-        if (webText != null && webImage != null) {
-            return new Selection(webImage.isInside(webText) ? webImage : webText);
+        // Text and image nodes can both contain the point: a list container reports a text
+        // node covering the whole screen while the image inside it is the real target.
+        // Pick the more specific (smaller) node so that image wins over the container.
+        AccessibilityCandidate nativePick = smaller(
+                firstContaining(buckets.nativeText, x, y),
+                firstContaining(buckets.nativeNonText, x, y));
+        AccessibilityCandidate webPick = smaller(
+                firstContaining(buckets.webText, x, y),
+                firstContaining(buckets.webNonText, x, y));
+        AccessibilityCandidate pick = nativePick != null ? nativePick : webPick;
+        return pick == null ? null : new Selection(pick);
+    }
+
+    private static AccessibilityCandidate smaller(
+            AccessibilityCandidate first,
+            AccessibilityCandidate second) {
+        if (first == null) {
+            return second;
         }
-        if (webText != null) return new Selection(webText);
-        if (webImage != null) return new Selection(webImage);
-
-        hit = firstContaining(buckets.nativeNonText, x, y);
-        return hit == null ? null : new Selection(hit);
+        if (second == null) {
+            return first;
+        }
+        return second.area() < first.area() ? second : first;
     }
 
     private static AccessibilityCandidate firstContaining(

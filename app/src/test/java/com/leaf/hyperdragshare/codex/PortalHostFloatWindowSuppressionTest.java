@@ -16,7 +16,7 @@ public final class PortalHostFloatWindowSuppressionTest {
     public void pendingPortalPreviewSuppressesHostFloatWindowBeforeItBecomesActive() {
         DragShareController controller = new DragShareController(
                 RuntimeEnvironment.getApplication(),
-                OverlayWindowPolicy.portal());
+                OverlayWindowPolicy.systemHosted());
 
         assertFalse(controller.shouldSuppressPortalHostFloatWindow());
 

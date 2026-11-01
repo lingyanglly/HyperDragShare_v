@@ -110,6 +110,41 @@ Root/MIUI 输入源；已连接的无障碍服务收到无障碍模式时才启�
 `CapturedContent`。这些字段和方法属于传送门 4.2.1 的私有实现，是升级宿主版本时最需要
 重新核对的接口。
 
+传送门的 `getBitmap()` 只覆盖标准图片控件。自绘贴纸（B 站 22/33 娘）、按钮背景图
+（投币面板的币图）这类 canvas/drawable 内容既没有文字也没有位图，回调里也不带取词参数，
+`getBitmap()` 拿不到位图，传送门最终只回一个 `observe_control_event=257`（未识别到）。
+
+这类内容由「组合模式」（`CONTENT_CAPTURE_COMBINED`）兜住：`isPortalCaptureMode()` 与
+`isAccessibilityCaptureMode()` 同时为真，传送门照常识别；传送门没产出内容时无障碍运行时
+按长按点读节点树并截图。
+
+**浮窗只有一个**：无障碍抓到的内容不再由模块进程开窗，而是通过 `ACTION_ACCESSIBILITY_CONTENT`
+广播（文字走 extra，图片先写模块外部缓存再传路径）交给传送门进程，
+`PortalHooks.handleAccessibilityContent()` 读回后用 `DragShareController.showFromHandoff()`
+显示。`showFromHandoff` 会直接置位 `rootInputProven` / `gestureMovedSinceDown`，因为无障碍只会在
+手势进行中移交，这两道"等输入/等移动"的门必须放行。重复显示由控制器的 `active` 守卫兜住，
+不需要额外的等待窗口。
+
+对注入了 `AppViewHook` 的目标 App（当前只有 `tv.danmaku.bili`），无障碍链路会先问它要
+“手指下真实的 ImageView”：`ViewDumpClient` 通过 root 把 `x,y` 写进目标 App 的外部缓存目录
+（`/storage/emulated/0/Android/data/<pkg>/cache/hds_view_req`，并 `chmod 666` 让 App 能读），
+注入进程的 watcher 轮询到请求后按视图几何找最小的 `ImageView`，用它的 `Drawable` 渲染 PNG
+写回同目录（`hds_view_resp.png`），找不到时写 `hds_view_resp.none` 让模块立刻回退。
+
+多进程目标 App（B 站同时有主进程和 `:download` / `:web` 子进程）共享这一个请求文件，因此
+**只有 `WindowManagerGlobal.mViews` 非空的进程才应答**，否则子进程会替主进程回答“无图”。
+
+B 站内的判定规则（`AccessibilityContentCaptureSource`）：
+
+| 手指下的内容 | 结果 |
+| --- | --- |
+| 真实 `ImageView`（贴纸、投币币图） | 纯图（`Drawable` 渲染，不带下层封面） |
+| 图像区域但没有 `ImageView`（视频播放器） | 无障碍按节点 bounds 截图 |
+| 文字容器（评论区、`关闭工作表`、`up主头像`） | 不触发 |
+
+B 站评论区是整块自绘表面（`FrameLayout` 1200×2608，内部没有独立 ImageView/无障碍节点），
+因此单张评论图片无法精确提取，1.13.0 起明确不处理这一场景。
+
 活动会话中再次收到 `startPick*Task` 会被忽略，防止传送门移动过程中重复初始化并删除已有
 预览。
 

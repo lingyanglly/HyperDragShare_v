@@ -20,6 +20,8 @@ public final class DragShareSettings {
 
     public static final int CONTENT_CAPTURE_PORTAL = 0;
     public static final int CONTENT_CAPTURE_ACCESSIBILITY = 1;
+    /** Portal first; the accessibility runtime only takes over when the portal stays silent. */
+    public static final int CONTENT_CAPTURE_COMBINED = 2;
     public static final int DEFAULT_CONTENT_CAPTURE_MODE = CONTENT_CAPTURE_PORTAL;
 
     public static final int LOG_LEVEL_DISABLED = 0;
@@ -979,11 +981,17 @@ public final class DragShareSettings {
     }
 
     public boolean isPortalCaptureMode() {
-        return contentCaptureMode == CONTENT_CAPTURE_PORTAL;
+        return contentCaptureMode == CONTENT_CAPTURE_PORTAL
+                || contentCaptureMode == CONTENT_CAPTURE_COMBINED;
     }
 
     public boolean isAccessibilityCaptureMode() {
-        return contentCaptureMode == CONTENT_CAPTURE_ACCESSIBILITY;
+        return contentCaptureMode == CONTENT_CAPTURE_ACCESSIBILITY
+                || contentCaptureMode == CONTENT_CAPTURE_COMBINED;
+    }
+
+    public boolean isCombinedCaptureMode() {
+        return contentCaptureMode == CONTENT_CAPTURE_COMBINED;
     }
 
     public boolean isModernStyle() {
@@ -1123,15 +1131,19 @@ public final class DragShareSettings {
     }
 
     private static int normalizeSimpleMenuPosition(int position) {
-        return position >= SIMPLE_MENU_POSITION_TOP
+        if (position == SIMPLE_MENU_POSITION_TOP) {
+            // "上" was merged into "顶部胶囊"; keep old configs on the top-anchored style.
+            return SIMPLE_MENU_POSITION_CAPSULE;
+        }
+        return position >= SIMPLE_MENU_POSITION_BOTTOM
                 && position <= SIMPLE_MENU_POSITION_CAPSULE
                 ? position
                 : DEFAULT_SIMPLE_MENU_POSITION;
     }
 
     private static int normalizeContentCaptureMode(int mode) {
-        return mode == CONTENT_CAPTURE_ACCESSIBILITY
-                ? CONTENT_CAPTURE_ACCESSIBILITY
+        return mode == CONTENT_CAPTURE_ACCESSIBILITY || mode == CONTENT_CAPTURE_COMBINED
+                ? mode
                 : CONTENT_CAPTURE_PORTAL;
     }
 
