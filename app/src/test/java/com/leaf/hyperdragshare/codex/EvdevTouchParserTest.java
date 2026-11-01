@@ -34,6 +34,29 @@ public final class EvdevTouchParserTest {
     }
 
     @Test
+    public void adoptsInFlightStrokeWhenStreamStartsWithPositionOnlyFrames() {
+        List<Integer> actions = new ArrayList<>();
+        EvdevTouchParser parser = new EvdevTouchParser((action, x, y) -> actions.add(action));
+
+        // The reader attached after the finger went down: no TRACKING_ID start and no
+        // BTN_TOUCH edge, only the next movement packet.
+        parser.consume(EvdevTouchParser.EV_ABS, EvdevTouchParser.ABS_MT_POSITION_X, 100);
+        parser.consume(EvdevTouchParser.EV_ABS, EvdevTouchParser.ABS_MT_POSITION_Y, 200);
+        parser.consume(EvdevTouchParser.EV_SYN, EvdevTouchParser.SYN_REPORT, 0);
+
+        parser.consume(EvdevTouchParser.EV_ABS, EvdevTouchParser.ABS_MT_POSITION_X, 110);
+        parser.consume(EvdevTouchParser.EV_SYN, EvdevTouchParser.SYN_REPORT, 0);
+
+        parser.consume(EvdevTouchParser.EV_ABS, EvdevTouchParser.ABS_MT_TRACKING_ID, -1);
+        parser.consume(EvdevTouchParser.EV_SYN, EvdevTouchParser.SYN_REPORT, 0);
+
+        assertEquals(Arrays.asList(
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_MOVE,
+                MotionEvent.ACTION_UP), actions);
+    }
+
+    @Test
     public void secondPointerCancelsInsteadOfFinishingShare() {
         List<Integer> actions = new ArrayList<>();
         EvdevTouchParser parser = new EvdevTouchParser((action, x, y) -> actions.add(action));

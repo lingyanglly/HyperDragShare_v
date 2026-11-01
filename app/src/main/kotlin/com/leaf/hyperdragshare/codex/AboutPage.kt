@@ -64,7 +64,7 @@ import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import androidx.compose.ui.graphics.BlendMode as ComposeBlendMode
 
-private const val PROJECT_URL = "https://github.com/Leaf-lsgtky/HyperDragShare"
+private const val PROJECT_URL = "https://github.com/lingyanglly/HyperDragShare_v"
 
 @Composable
 fun DragShareAboutPage(

@@ -30,6 +30,25 @@ final class GestureMath {
         }
     }
 
+    /**
+     * Returns the left/right trigger edge under the pointer, or -1 when the pointer is
+     * outside both side bands. Top and bottom never participate, so a centred pointer
+     * keeps the menu hidden until it approaches one of the two sides.
+     */
+    static int nearestSideEdge(float pointerX, int screenWidth, int triggerWidth) {
+        if (screenWidth <= 0 || triggerWidth <= 0 || !Float.isFinite(pointerX)) {
+            return -1;
+        }
+        float left = Math.max(0f, pointerX);
+        float right = Math.max(0f, screenWidth - pointerX);
+        if (Math.min(left, right) > triggerWidth) {
+            return -1;
+        }
+        return left <= right
+                ? DragShareSettings.SIMPLE_MENU_POSITION_LEFT
+                : DragShareSettings.SIMPLE_MENU_POSITION_RIGHT;
+    }
+
     static int edgeScrollDirection(float pointerX, int viewportWidth, int edgeWidth) {
         if (viewportWidth <= 0 || edgeWidth <= 0) {
             return 0;

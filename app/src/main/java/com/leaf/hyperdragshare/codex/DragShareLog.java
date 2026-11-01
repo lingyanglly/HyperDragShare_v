@@ -6,7 +6,6 @@ import android.net.Uri;
 import android.os.Process;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -75,10 +74,6 @@ final class DragShareLog {
 
     static boolean isDebugEnabled() {
         return configuredLevel == DragShareSettings.LOG_LEVEL_DEBUG;
-    }
-
-    static boolean isFileDestination() {
-        return configuredDestination == DragShareSettings.LOG_DESTINATION_FILE;
     }
 
     static int configuredDestination() {
@@ -355,21 +350,6 @@ final class DragShareLog {
         int count;
         while ((count = input.read(buffer)) >= 0) {
             output.write(buffer, 0, count);
-        }
-    }
-
-    private static String readText(InputStream input, int maximumChars) throws IOException {
-        try (InputStream stream = input;
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[1024];
-            int count;
-            while ((count = stream.read(buffer)) >= 0) {
-                int remaining = maximumChars - output.size();
-                if (remaining > 0) {
-                    output.write(buffer, 0, Math.min(remaining, count));
-                }
-            }
-            return output.toString(StandardCharsets.UTF_8.name());
         }
     }
 

@@ -219,7 +219,10 @@ final class AccessibilityScreenshotter {
                 mapped.top,
                 mapped.width(),
                 mapped.height());
-        Bitmap software = region.copy(Bitmap.Config.ARGB_8888, false);
+        // Force the copy: with copyPixels=false the framework may hand back the very same
+        // instance when the source is immutable and already ARGB_8888, and recycling
+        // `region` would then recycle the bitmap we are about to deliver.
+        Bitmap software = region.copy(Bitmap.Config.ARGB_8888, true);
         if (region != full && !region.isRecycled()) {
             region.recycle();
         }

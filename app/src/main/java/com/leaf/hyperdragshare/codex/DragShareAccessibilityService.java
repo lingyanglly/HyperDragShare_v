@@ -80,8 +80,6 @@ public final class DragShareAccessibilityService extends AccessibilityService {
     private ContentObserver settingsObserver;
     private BroadcastReceiver screenReceiver;
     private volatile boolean screenInteractive = true;
-    private volatile String foregroundPackage;
-    private volatile int windowGeneration;
     private long rootNotReadySince;
     private int rootRestartCount;
     private boolean lastReportedRootReady;
@@ -112,18 +110,8 @@ public final class DragShareAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null) {
-            return;
-        }
-        CharSequence packageName = event.getPackageName();
-        foregroundPackage = packageName == null ? null : packageName.toString();
-        int type = event.getEventType();
-        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            windowGeneration++;
-        }
+        // Deliberately passive: the node tree is only read after a long-press timeout via
+        // AccessibilityContentCaptureSource. No state is derived from individual events.
     }
 
     @Override
@@ -175,9 +163,7 @@ public final class DragShareAccessibilityService extends AccessibilityService {
                 + " point=" + Math.round(x) + "," + Math.round(y));
         for (WindowRoot windowRoot : roots) {
             try {
-                List<AccessibilityNodeSnapshot> snapshots = snapshotTree(
-                        windowRoot.root,
-                        windowRoot.layer);
+                List<AccessibilityNodeSnapshot> snapshots = snapshotTree(windowRoot.root);
                 int[] screen = screenSize();
                 AccessibilityNodeClassifier classifier = new AccessibilityNodeClassifier(
                         getResources().getDisplayMetrics().density,
@@ -238,35 +224,42 @@ public final class DragShareAccessibilityService extends AccessibilityService {
             thread.setDaemon(true);
             return thread;
         });
-        controller = new DragShareController(
-                this,
-                OverlayWindowPolicy.accessibility());
-        screenshotter = new AccessibilityScreenshotter(this, classifierExecutor);
-        rootTouchSource = new RootTouchSource(
-                getApplicationContext(),
-                (action, x, y, eventTime) -> {
-                    if (action == android.view.MotionEvent.ACTION_DOWN
-                            || action == android.view.MotionEvent.ACTION_UP
-                            || action == android.view.MotionEvent.ACTION_CANCEL) {
-                        trace("root action=" + android.view.MotionEvent.actionToString(action)
-                                + " point=" + Math.round(x) + "," + Math.round(y));
-                    }
-                    AccessibilityContentCaptureSource source = captureSource;
-                    if (source != null) {
-                        source.onPointerEvent(action, x, y, eventTime);
-                    }
-                });
-        captureSource = new AccessibilityContentCaptureSource(
-                this,
-                controller,
-                rootTouchSource,
-                classifierExecutor,
-                screenshotter);
-        rootTouchSource.start();
-        mainHandler.removeCallbacks(rootReadyReporter);
-        mainHandler.post(rootReadyReporter);
-        DragShareLog.i(TAG, "accessibility runtime started");
-        trace("runtime started");
+        try {
+            controller = new DragShareController(
+                    this,
+                    OverlayWindowPolicy.accessibility());
+            screenshotter = new AccessibilityScreenshotter(this, classifierExecutor);
+            rootTouchSource = new RootTouchSource(
+                    getApplicationContext(),
+                    (action, x, y, eventTime) -> {
+                        if (action == android.view.MotionEvent.ACTION_DOWN
+                                || action == android.view.MotionEvent.ACTION_UP
+                                || action == android.view.MotionEvent.ACTION_CANCEL) {
+                            trace("root action=" + android.view.MotionEvent.actionToString(action)
+                                    + " point=" + Math.round(x) + "," + Math.round(y));
+                        }
+                        AccessibilityContentCaptureSource source = captureSource;
+                        if (source != null) {
+                            source.onPointerEvent(action, x, y, eventTime);
+                        }
+                    });
+            captureSource = new AccessibilityContentCaptureSource(
+                    this,
+                    controller,
+                    rootTouchSource,
+                    classifierExecutor,
+                    screenshotter);
+            rootTouchSource.start();
+            mainHandler.removeCallbacks(rootReadyReporter);
+            mainHandler.post(rootReadyReporter);
+            DragShareLog.i(TAG, "accessibility runtime started");
+            trace("runtime started");
+        } catch (Throwable error) {
+            // A failure here would otherwise bubble out of onServiceConnected, the settings
+            // observer or the screen receiver and crash the service process.
+            DragShareLog.w(TAG, "unable to start accessibility runtime", error);
+            stopRuntime();
+        }
     }
 
     private void stopRuntime() {
@@ -404,12 +397,10 @@ public final class DragShareAccessibilityService extends AccessibilityService {
         });
     }
 
-    private List<AccessibilityNodeSnapshot> snapshotTree(
-            AccessibilityNodeInfo root,
-            int layer) {
+    private List<AccessibilityNodeSnapshot> snapshotTree(AccessibilityNodeInfo root) {
         List<AccessibilityNodeSnapshot> snapshots = new ArrayList<>();
         TraversalBudget budget = new TraversalBudget();
-        traverse(root, 0, false, layer, snapshots, budget);
+        traverse(root, 0, false, snapshots, budget);
         if (budget.exhausted) {
             DragShareLog.w(TAG, "node traversal budget exhausted nodes=" + budget.nodeCount);
         }
@@ -420,7 +411,6 @@ public final class DragShareAccessibilityService extends AccessibilityService {
             AccessibilityNodeInfo node,
             int depth,
             boolean inheritedWebView,
-            int layer,
             List<AccessibilityNodeSnapshot> snapshots,
             TraversalBudget budget) {
         if (node == null || budget.exhausted || depth > MAX_NODE_DEPTH) {
@@ -440,26 +430,21 @@ public final class DragShareAccessibilityService extends AccessibilityService {
                 .bounds(bounds)
                 .packageName(asString(node.getPackageName()))
                 .className(className)
-                .viewId(node.getViewIdResourceName())
                 .text(asString(node.getText()))
                 .contentDescription(asString(node.getContentDescription()))
                 .visible(node.isVisibleToUser())
                 .editable(node.isEditable())
                 .password(node.isPassword())
-                .clickable(node.isClickable())
-                .longClickable(node.isLongClickable())
-                .important(node.isImportantForAccessibility())
                 .leaf(childCount == 0)
                 .insideWebView(insideWebView)
                 .depth(depth)
-                .windowLayer(layer)
                 .traversalOrder(budget.nodeCount)
                 .build());
         for (int index = 0; index < childCount && !budget.exhausted; index++) {
             AccessibilityNodeInfo child = null;
             try {
                 child = node.getChild(index);
-                traverse(child, depth + 1, insideWebView, layer, snapshots, budget);
+                traverse(child, depth + 1, insideWebView, snapshots, budget);
             } finally {
                 recycleNode(child);
             }

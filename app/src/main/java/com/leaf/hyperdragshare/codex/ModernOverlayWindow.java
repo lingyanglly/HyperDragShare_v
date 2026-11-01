@@ -20,10 +20,12 @@ import java.util.function.Consumer;
  * below an overlay window.
  */
 final class ModernOverlayWindow {
+    private static final String TAG = "DragShare/Overlay";
     private static final float CARD_CORNER_RADIUS_DP = 16f;
     private static final long ENTER_DURATION_MS = 220L;
     private static final float ENTER_INITIAL_SCALE = 0.9f;
     private static final float EXIT_TARGET_SCALE = 0.96f;
+    private static final int SURFACE_VOTE_MAX_ATTEMPTS = 8;
     private static final PathInterpolator ENTER_INTERPOLATOR =
             new PathInterpolator(0.2f, 0f, 0f, 1f);
     private static final PathInterpolator EXIT_INTERPOLATOR =
@@ -71,6 +73,7 @@ final class ModernOverlayWindow {
         window.setDimAmount(0f);
         window.setWindowAnimations(0);
         window.setAttributes(layoutParams);
+        DisplayRefreshRate.apply(window, context);
         window.setBackgroundBlurRadius(this.blurRadiusPx);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             window.getDecorView().setForceDarkAllowed(false);
@@ -89,7 +92,32 @@ final class ModernOverlayWindow {
         if (!disposed && !dialog.isShowing()) {
             prepareDecorForEnter();
             dialog.show();
+            applySurfaceFrameRateVote(0);
         }
+    }
+
+    /**
+     * The window surface control only exists after the first relayout, so the vote is
+     * retried on animation frames until it lands. A failed vote leaves the window-attribute
+     * request in place; the drag still works, only the panel rate follows the app.
+     */
+    private void applySurfaceFrameRateVote(int attempt) {
+        if (disposed) {
+            return;
+        }
+        if (attempt >= SURFACE_VOTE_MAX_ATTEMPTS) {
+            DragShareLog.w(TAG, "surface frame-rate vote unavailable after "
+                    + attempt + " attempts; panel rate follows the app");
+            return;
+        }
+        View decorView = decorView();
+        if (decorView == null) {
+            return;
+        }
+        if (DisplayRefreshRate.applySurfaceVote(decorView, overlayView.getContext())) {
+            return;
+        }
+        decorView.postOnAnimation(() -> applySurfaceFrameRateVote(attempt + 1));
     }
 
     void showAnimated() {
@@ -151,6 +179,39 @@ final class ModernOverlayWindow {
         if (decorView != null) {
             windowManager.updateViewLayout(decorView, layoutParams);
         }
+    }
+
+    /**
+     * A barely visible scale pulse (1.000 → 1.004 → 1.000). HyperOS' refresh policy keeps
+     * its high-frame-rate interaction window alive while window animations run, so pulsing
+     * during a drag prevents the panel from dropping to the app's 60 Hz mid-gesture.
+     */
+    void pulseBoost() {
+        if (disposed || !dialog.isShowing()) {
+            return;
+        }
+        View decorView = decorView();
+        if (decorView == null) {
+            return;
+        }
+        final int generation = animationGeneration;
+        decorView.animate().cancel();
+        decorView.animate()
+                .scaleX(1.004f)
+                .scaleY(1.004f)
+                .setDuration(80L)
+                .withEndAction(() -> {
+                    if (disposed || animationGeneration != generation) {
+                        return;
+                    }
+                    View current = decorView();
+                    if (current == null) {
+                        return;
+                    }
+                    current.animate().cancel();
+                    current.animate().scaleX(1f).scaleY(1f).setDuration(80L).start();
+                })
+                .start();
     }
 
     void dispose() {

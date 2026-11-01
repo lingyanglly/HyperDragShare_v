@@ -578,6 +578,31 @@ public final class DragShareSettingsTest {
     }
 
     @Test
+    public void bothSidesMenuPositionSurvivesRoundTripAndRejectsUnknownValues() {
+        Bundle bundle = new Bundle();
+        bundle.putInt(
+                "simple_menu_position",
+                DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES);
+        assertEquals(
+                DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES,
+                DragShareSettings.fromBundle(bundle).simpleMenuPosition);
+
+        bundle.putInt(
+                "simple_menu_position",
+                DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE);
+        assertEquals(
+                DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE,
+                DragShareSettings.fromBundle(bundle).simpleMenuPosition);
+
+        bundle.putInt(
+                "simple_menu_position",
+                DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE + 1);
+        assertEquals(
+                DragShareSettings.DEFAULT_SIMPLE_MENU_POSITION,
+                DragShareSettings.fromBundle(bundle).simpleMenuPosition);
+    }
+
+    @Test
     public void accessibilityBlacklistCombinesUserAndBuiltInPackages() {
         assertTrue(AccessibilityBlacklist.isBlockedByPackages(
                 "pkg.user",

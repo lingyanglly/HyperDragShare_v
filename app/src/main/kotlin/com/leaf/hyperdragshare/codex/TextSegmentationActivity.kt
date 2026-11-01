@@ -63,8 +63,19 @@ class TextSegmentationActivity : ComponentActivity() {
     private var currentSegment: IntArray? = null
     private var animatedDismissRequester: (() -> Unit)? = null
 
+    private val boomHost = object : BoomChipPage.Host {
+        override fun requestDismiss() {
+            requestAnimatedDismissFromLegacy()
+        }
+
+        override fun openSearch(text: String, type: Int) {
+            this@TextSegmentationActivity.openSearch(text, type)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DisplayRefreshRate.apply(window, this)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = AndroidColor.TRANSPARENT
         window.navigationBarColor = AndroidColor.TRANSPARENT
@@ -75,15 +86,17 @@ class TextSegmentationActivity : ComponentActivity() {
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
             BoomAnimator.makeFadeIn(this, BoomAnimator.BOOM_DURATION)
         }
-        boomChipPage = BoomChipPage(this, legacyContentView, false).also { page ->
+        boomChipPage = BoomChipPage(this, boomHost, legacyContentView, false).also { page ->
             page.restoreSelectedState(savedInstanceState?.getSerializable(SELECTED_STATE))
         }
 
         setContent {
+            BackHandler { animatedDismissRequester?.invoke() }
             BigBangOverlayContent(
                 contentView = legacyContentView,
                 touchX = launchTouchX,
                 touchY = launchTouchY,
+                dark = isSystemInDarkTheme(),
                 onDismissRequesterChanged = { animatedDismissRequester = it },
                 onDismissRequest = { shouldDismissPage() },
                 onDismissFinished = { finish() },
@@ -271,10 +284,11 @@ class TextSegmentationActivity : ComponentActivity() {
 }
 
 @Composable
-private fun BigBangOverlayContent(
+internal fun BigBangOverlayContent(
     contentView: View,
     touchX: Int,
     touchY: Int,
+    dark: Boolean,
     onDismissRequesterChanged: ((() -> Unit)?) -> Unit,
     onDismissRequest: () -> Boolean,
     onDismissFinished: () -> Unit,
@@ -283,7 +297,6 @@ private fun BigBangOverlayContent(
     onShareAll: () -> Unit,
     onMore: () -> Unit,
 ) {
-    val dark = isSystemInDarkTheme()
     val panelMetrics = rememberOverlayPanelMetrics()
     val panelBackground = if (dark) Color(0xFF171B20) else Color(0xFFF3F3F4)
     val panelBorder = if (dark) Color(0xFF2E353E) else Color(0xFFD7D7DA)
@@ -335,7 +348,6 @@ private fun BigBangOverlayContent(
     }
     LaunchedEffect(Unit) { panelVisible = true }
 
-    BackHandler(onBack = requestDismiss)
     ApplyOverlaySystemBars(
         statusBarColor = if (panelMetrics.fullScreen) topBarColor else Color.Transparent,
         navigationBarColor = if (panelMetrics.fullScreen) bottomBarColor else Color.Transparent,

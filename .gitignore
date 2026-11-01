@@ -1,7 +1,11 @@
 .gradle/
 .idea/
+.kotlin/
 **/.cxx/
 **/build/
 local.properties
 signing/
 *.iml
+*.apk
+*.idsig
+*.log

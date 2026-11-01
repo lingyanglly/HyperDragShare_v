@@ -13,8 +13,6 @@ final class AccessibilityCandidate {
     final Rect bounds;
     final String text;
     final String sourcePackage;
-    final boolean editable;
-    final boolean insideWebView;
     final boolean strongImage;
     final boolean leaf;
     final int depth;
@@ -29,8 +27,6 @@ final class AccessibilityCandidate {
         this.bounds = new Rect(snapshot.bounds);
         this.text = text;
         this.sourcePackage = snapshot.packageName;
-        this.editable = snapshot.editable;
-        this.insideWebView = snapshot.insideWebView;
         this.strongImage = strongImage;
         this.leaf = snapshot.leaf;
         this.depth = snapshot.depth;

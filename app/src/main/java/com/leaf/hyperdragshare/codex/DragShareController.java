@@ -4,6 +4,8 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Insets;
@@ -44,6 +46,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 final class DragShareController {
     private static final String TAG = "DragShare/UI";
@@ -53,7 +57,14 @@ final class DragShareController {
     private static final int PORTAL_PREVIEW_TEXT_SIZE_DP = 112;
     private static final int PORTAL_PREVIEW_IMAGE_SIZE_DP = 116;
     private static final int MENU_HEIGHT_DP = 96;
-    private static final int SIMPLE_SIDE_MENU_WIDTH_DP = 112;
+    private static final int SIMPLE_SIDE_MENU_WIDTH_DP = 72;
+    private static final int VERTICAL_MENU_ITEM_HEIGHT_DP = 72;
+    private static final int VERTICAL_MENU_MIN_HEIGHT_DP = 380;
+    private static final int VERTICAL_MENU_MAX_HEIGHT_PERCENT = 82;
+    private static final int SIDE_MENU_SCROLL_LEAVE_SLOP_DP = 8;
+    private static final int SIDE_MENU_INNER_SCROLL_BAND_DP = 56;
+    private static final int CAPSULE_WIDTH_DP = 320;
+    private static final int CAPSULE_HEIGHT_DP = 96;
     private static final int PORTAL_MENU_HEIGHT_DP = 152;
     private static final int MENU_TRIGGER_DP = 72;
     private static final int SIMPLE_MENU_ACTIVATION_SLOP_DP = 16;
@@ -102,7 +113,7 @@ final class DragShareController {
                     : Math.min(48L, Math.max(1L, now - lastEdgeScrollUptime));
             lastEdgeScrollUptime = now;
             float distanceWithRemainder = dpFloat(settings.scrollSpeedDpPerSecond)
-                    * edgeScrollSpeedMultiplier() * elapsed / 1000f
+                    * edgeScrollMultiplierForCurrentGesture() * elapsed / 1000f
                     + edgeScrollRemainderPx;
             int distance = (int) distanceWithRemainder;
             edgeScrollRemainderPx = distanceWithRemainder - distance;
@@ -157,6 +168,24 @@ final class DragShareController {
     private long lastHandledEventTime = Long.MIN_VALUE;
     private int lastHandledAction = -1;
     private int edgeDirection;
+    private boolean edgeScrollOutsideMenu;
+    private float edgeScrollDepth;
+    private volatile long lastPointerUptime;
+    private boolean sessionGotPointerDown;
+    private static final long SESSION_STALL_TIMEOUT_MS = 1500L;
+    private final Runnable stuckSessionCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (!active || !sessionGotPointerDown
+                    && SystemClock.uptimeMillis() - lastPointerUptime
+                    >= SESSION_STALL_TIMEOUT_MS) {
+                if (active) {
+                    log("session stalled without a pointer DOWN; cancelling");
+                    cancelGestureOnMain();
+                }
+            }
+        }
+    };
     private boolean inputSourceLogged;
     private boolean duplicateStartLogged;
     private boolean backgroundBlockAttempted;
@@ -213,6 +242,14 @@ final class DragShareController {
     private CircleMenuOverlayView circleMenuView;
     private WindowManager.LayoutParams circleMenuParams;
     private List<ShareTarget> shareTargets = new ArrayList<>();
+    private static final ExecutorService TARGET_QUERY_EXECUTOR =
+            Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "drag-share-targets");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static volatile List<ShareTarget> cachedTextTargets;
+    private static volatile List<ShareTarget> cachedImageTargets;
     private ShareTarget selectedTarget;
     private boolean menuShown;
 
@@ -251,6 +288,8 @@ final class DragShareController {
     private Session session;
     private DragShareSettings settings = DragShareSettings.defaults();
     private OverlayColors palette = OverlayColors.light();
+    private SegmentationOverlay segmentationOverlay;
+    private Runnable segmentationClosedListener;
 
     DragShareController(Context context) {
         this(context, OverlayWindowPolicy.portal());
@@ -272,8 +311,63 @@ final class DragShareController {
         pendingPortalHostFloatWindowSuppression = true;
     }
 
+    private static final long FIRST_SHOW_WAIT_MS = 3_000L;
+
+    private volatile boolean rootInputProven;
+    private volatile boolean miuiMotionSeen;
+    private volatile boolean rootHelperClientPresent;
+    private volatile long showRequestId;
+    private volatile int lastObservedAction = -1;
+    private volatile boolean deferredShowPending;
+    private long deferredShowRequestId;
+    private CapturedContent deferredShowPayload;
+    private DragShareSettings deferredShowSettings;
+    private float deferredShowInitialX;
+    private float deferredShowInitialY;
+    private final Runnable deferredShowRunnable = this::runDeferredShow;
+    private final Runnable deferredShowAbortRunnable = this::abortDeferredShow;
+    private volatile Runnable hostSplashHider;
+    /**
+     * HyperOS' refresh policy keeps its high-frame-rate interaction window alive while
+     * window animations run and drops the panel to the app's rate a few seconds into an
+     * otherwise static hold. A subtle periodic pulse on the preview window keeps the drag
+     * at the panel's high rate.
+     */
+    private static final long BOOST_PULSE_INTERVAL_MS = 500L;
+    private final Runnable boostPulseRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!active || destroyed) {
+                return;
+            }
+            pulseBoost();
+            mainHandler.postDelayed(this, BOOST_PULSE_INTERVAL_MS);
+        }
+    };
+
+    void noteRootPointer() {
+        rootInputProven = true;
+    }
+
+    void noteMiuiMotion() {
+        miuiMotionSeen = true;
+    }
+
+    void noteRootHelperClientPresent(boolean present) {
+        rootHelperClientPresent = present;
+    }
+
+    /** Hides the portal's own splash preview once the deferred takeover has really started. */
+    void setHostSplashHider(Runnable hider) {
+        hostSplashHider = hider;
+    }
+
     boolean shouldSuppressPortalHostFloatWindow() {
-        return active || pendingPortalHostFloatWindowSuppression;
+        // Only hide the portal's own float window once one input source has actually
+        // delivered a frame. Suppressing it earlier stops Taplus' internal drag feed and
+        // leaves the first gesture with no pointer at all.
+        boolean inputProven = rootInputProven || miuiMotionSeen;
+        return inputProven && (active || pendingPortalHostFloatWindowSuppression);
     }
 
     void show(
@@ -284,7 +378,8 @@ final class DragShareController {
         if (content == null) {
             return;
         }
-        runOnMain(() -> showOnMain(content, initialX, initialY, loadedSettings));
+        final long requestId = ++showRequestId;
+        runOnMain(() -> showOnMain(content, initialX, initialY, loadedSettings, requestId));
     }
 
     void cancelActiveSession() {
@@ -331,14 +426,27 @@ final class DragShareController {
             long eventTime,
             String source,
             Runnable beforeFinish) {
-        DragShareLog.d(TAG, "pointer received source=" + source
-                + " action=" + MotionEvent.actionToString(action)
-                + " point=" + Math.round(x) + "," + Math.round(y)
-                + " active=" + active
-                + " time=" + eventTime);
+        if (DragShareLog.isDebugEnabled()) {
+            DragShareLog.d(TAG, "pointer received source=" + source
+                    + " action=" + MotionEvent.actionToString(action)
+                    + " point=" + Math.round(x) + "," + Math.round(y)
+                    + " active=" + active
+                    + " time=" + eventTime);
+        }
         lastObservedX = x;
         lastObservedY = y;
         lastObservedEventTime = eventTime;
+        lastObservedAction = action;
+        lastPointerUptime = SystemClock.uptimeMillis();
+        if (deferredShowPending) {
+            // The first real frame is the only reliable "input is available now" signal.
+            // A fixed delay can expire while the finger is still held stationary.
+            mainHandler.removeCallbacks(deferredShowRunnable);
+            mainHandler.post(deferredShowRunnable);
+        }
+        if (action == MotionEvent.ACTION_DOWN) {
+            sessionGotPointerDown = true;
+        }
         mainHandler.post(() -> {
             if (active && !inputSourceLogged) {
                 inputSourceLogged = true;
@@ -387,6 +495,8 @@ final class DragShareController {
     void destroy() {
         destroyed = true;
         pendingPortalHostFloatWindowSuppression = false;
+        clearDeferredShow();
+        closeSegmentation();
         runOnMain(() -> {
             active = false;
             if (session != null) {
@@ -403,9 +513,41 @@ final class DragShareController {
             CapturedContent payload,
             float requestedInitialX,
             float requestedInitialY,
-            DragShareSettings loadedSettings) {
+            DragShareSettings loadedSettings,
+            long requestId) {
         if (destroyed) {
             pendingPortalHostFloatWindowSuppression = false;
+            return;
+        }
+        if (requestId != showRequestId) {
+            log("overlay start superseded by a newer request");
+            return;
+        }
+        if (deferredShowPending && deferredShowRequestId != requestId) {
+            clearDeferredShow();
+        }
+        if (!rootInputProven && !miuiMotionSeen) {
+            // The portal process was just (re)started and neither evdev nor MIUI motion
+            // has produced a single frame yet (su grant / pipe warm-up). Taking over here
+            // would only paint a preview that cannot follow the finger. With the persistent
+            // root helper attached, hold the takeover until the first real frame arrives
+            // (or the cap expires): a fixed delay can expire while the finger is still
+            // held stationary before the drag starts.
+            if (rootHelperClientPresent && !deferredShowPending) {
+                deferredShowPending = true;
+                deferredShowRequestId = requestId;
+                deferredShowPayload = payload;
+                deferredShowSettings = loadedSettings;
+                deferredShowInitialX = requestedInitialX;
+                deferredShowInitialY = requestedInitialY;
+                log("input not ready; taking over on the first input frame (waiting up to "
+                        + FIRST_SHOW_WAIT_MS + "ms)");
+                mainHandler.removeCallbacks(deferredShowAbortRunnable);
+                mainHandler.postDelayed(deferredShowAbortRunnable, FIRST_SHOW_WAIT_MS);
+                return;
+            }
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay skipped: no input frame yet in this portal process");
             return;
         }
         if (active) {
@@ -458,6 +600,7 @@ final class DragShareController {
             }
             active = true;
             pendingPortalHostFloatWindowSuppression = false;
+            startBoostPulse();
             registerNearHandSensorIfNeeded();
             traceAccessibility("overlay added kind=" + payload.kind);
         } catch (Throwable error) {
@@ -488,10 +631,35 @@ final class DragShareController {
         updatePortalPullEffect(initialX, initialY);
         startPreviewEnterAnimation();
 
-        // Querying package icons can be comparatively slow. The preview is
-        // already visible before the bottom menu is assembled.
-        shareTargets = safeQueryTargets(payload);
-        createMenu();
+        // Querying package icons can be comparatively slow: 100+ targets mean 100+
+        // PackageManager lookups. Never block the gesture on it. Cached results are used
+        // immediately; the first gesture fills the cache in the background and assembles
+        // the menu as soon as it is ready.
+        List<ShareTarget> rawTargets = cachedRawTargets(payload.isImage());
+        if (rawTargets != null) {
+            shareTargets = prepareTargets(safeApplyTargets(rawTargets, payload.isImage()), payload);
+            createMenu();
+            if (isCapsuleMenu()) {
+                showMenuOnMain();
+            }
+        } else {
+            final Session querySession = session;
+            final boolean imagePayload = payload.isImage();
+            final CapturedContent queryPayload = payload;
+            TARGET_QUERY_EXECUTOR.execute(() -> {
+                List<ShareTarget> queried = safeQueryTargets(queryPayload);
+                mainHandler.post(() -> {
+                    if (destroyed || !active || querySession != session) {
+                        return;
+                    }
+                    shareTargets = prepareTargets(queried, queryPayload);
+                    createMenu();
+                    if (shouldShowSimpleMenu(lastX, lastY)) {
+                        showMenuOnMain();
+                    }
+                });
+            });
+        }
         if (isCircleStyle() && circleMenuView != null && circleMenuParams != null) {
             try {
                 circleMenuView.setVisibility(View.VISIBLE);
@@ -509,6 +677,10 @@ final class DragShareController {
                 + " style=" + settings.uiStyle
                 + " blockBackground=" + settings.blockBackgroundScroll
                 + " at=" + Math.round(initialX) + "," + Math.round(initialY));
+        sessionGotPointerDown = false;
+        lastPointerUptime = SystemClock.uptimeMillis();
+        mainHandler.removeCallbacks(stuckSessionCheck);
+        mainHandler.postDelayed(stuckSessionCheck, SESSION_STALL_TIMEOUT_MS + 200L);
 
         if (payload.isImage()) {
             final Session stagedSession = session;
@@ -541,17 +713,240 @@ final class DragShareController {
         }
     }
 
+    private void runDeferredShow() {
+        if (!deferredShowPending) {
+            return;
+        }
+        deferredShowPending = false;
+        mainHandler.removeCallbacks(deferredShowAbortRunnable);
+        CapturedContent payload = deferredShowPayload;
+        DragShareSettings loadedSettings = deferredShowSettings;
+        float requestedInitialX = deferredShowInitialX;
+        float requestedInitialY = deferredShowInitialY;
+        long requestId = deferredShowRequestId;
+        deferredShowPayload = null;
+        deferredShowSettings = null;
+        if (destroyed) {
+            pendingPortalHostFloatWindowSuppression = false;
+            return;
+        }
+        if (requestId != showRequestId) {
+            log("overlay grace skipped: superseded by a newer start");
+            return;
+        }
+        if (!rootInputProven && !miuiMotionSeen) {
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay skipped: no input frame yet in this portal process");
+            return;
+        }
+        boolean gestureEnded = lastObservedAction == MotionEvent.ACTION_UP
+                || lastObservedAction == MotionEvent.ACTION_CANCEL;
+        if (gestureEnded) {
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay grace skipped: gesture ended before the input frame arrived");
+            return;
+        }
+        // The finger may have moved since startPick; start the overlay under the latest
+        // observed point instead of the stale long-press origin.
+        float initialX = lastObservedX >= 0f ? lastObservedX : requestedInitialX;
+        float initialY = lastObservedY >= 0f ? lastObservedY : requestedInitialY;
+        log("first input frame arrived; taking over the drag");
+        showOnMain(payload, initialX, initialY, loadedSettings, requestId);
+        // The DOWN that started this gesture happened before the session existed, so the
+        // stall guard must not treat the session as "never received a pointer down".
+        sessionGotPointerDown = true;
+        if (active) {
+            Runnable hider = hostSplashHider;
+            if (hider != null) {
+                log("invoking host splash hider");
+                hider.run();
+            } else {
+                log("host splash hider missing");
+            }
+        }
+    }
+
+    private void abortDeferredShow() {
+        if (!deferredShowPending) {
+            return;
+        }
+        clearDeferredShow();
+        pendingPortalHostFloatWindowSuppression = false;
+        log("overlay skipped: no input frame within " + FIRST_SHOW_WAIT_MS + "ms");
+    }
+
+    private void clearDeferredShow() {
+        deferredShowPending = false;
+        deferredShowPayload = null;
+        deferredShowSettings = null;
+        mainHandler.removeCallbacks(deferredShowAbortRunnable);
+    }
+
     private List<ShareTarget> safeQueryTargets(CapturedContent payload) {
         try {
             List<ShareTarget> queried = ShareTargetRepository.query(context, payload);
-            return ShareTargetRepository.applySettings(
-                    context,
-                    queried,
-                    settings,
-                    payload != null && payload.isImage());
+            boolean image = payload != null && payload.isImage();
+            storeRawTargets(image, queried);
+            return ShareTargetRepository.applySettings(context, queried, settings, image);
         } catch (Throwable error) {
             log("share target query failed", error);
             return new ArrayList<>();
+        }
+    }
+
+    private List<ShareTarget> prepareTargets(List<ShareTarget> base, CapturedContent payload) {
+        List<ShareTarget> result = new ArrayList<>(buildActionTargets(payload));
+        List<ShareTarget> ordered = TargetOrdering.order(base, payload == null ? null : payload.text);
+        if (ordered != null) {
+            result.addAll(ordered);
+        }
+        if (settings.isTargetVisible(DragShareSettings.TARGET_SYSTEM_SHARE)) {
+            Drawable moreIcon = null;
+            try {
+                moreIcon = context.getDrawable(R.drawable.ic_share);
+            } catch (Throwable ignored) {
+                // The tile still works without an icon.
+            }
+            result.add(ShareTarget.systemShare(moreIcon));
+        }
+        return ShareTargetRepository.dedupeByPackage(result);
+    }
+
+    /**
+     * OriginOS-like suggestions that do not depend on the app declaring ACTION_SEND:
+     * a map app can still receive geo:, the dialer tel:, mail clients mailto:.
+     */
+    private List<ShareTarget> buildActionTargets(CapturedContent payload) {
+        List<ShareTarget> actions = new ArrayList<>();
+        if (payload == null || payload.isImage() || payload.text == null) {
+            return actions;
+        }
+        String text = payload.text.trim();
+        if (text.isEmpty()) {
+            return actions;
+        }
+        PackageManager packageManager = context.getPackageManager();
+        int kind = ContentKind.classify(text);
+        if (kind == ContentKind.ADDRESS) {
+            addGeoAction(actions, packageManager, text, "com.autonavi.minimap");
+            addGeoAction(actions, packageManager, text, "com.baidu.BaiduMap");
+            addGeoAction(actions, packageManager, text, "com.tencent.map");
+        } else if (kind == ContentKind.PHONE) {
+            addUriAction(actions, packageManager, text, Intent.ACTION_DIAL, "tel:",
+                    new String[]{"com.android.dialer", "com.google.android.dialer"},
+                    "action:dial");
+        } else if (kind == ContentKind.EMAIL) {
+            addUriAction(actions, packageManager, text, Intent.ACTION_SENDTO, "mailto:",
+                    new String[]{"com.tencent.androidqqmail", "com.netease.mail",
+                            "com.android.email", "com.google.android.gm"},
+                    "action:mail");
+        }
+        return actions;
+    }
+
+    private void addGeoAction(
+            List<ShareTarget> out,
+            PackageManager packageManager,
+            String address,
+            String packageName) {
+        try {
+            ApplicationInfo info = packageManager.getApplicationInfo(packageName, 0);
+            Intent intent = new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("geo:0,0?q=" + Uri.encode(address)));
+            intent.setPackage(packageName);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            out.add(ShareTarget.action(
+                    info.loadLabel(packageManager),
+                    info.loadIcon(packageManager),
+                    "action:geo:" + packageName,
+                    packageName,
+                    intent));
+        } catch (Throwable ignored) {
+            // App not installed or not resolvable.
+        }
+    }
+
+    private void addUriAction(
+            List<ShareTarget> out,
+            PackageManager packageManager,
+            String value,
+            String action,
+            String scheme,
+            String[] packages,
+            String keyPrefix) {
+        String digits = value.replaceAll("[^0-9+]", "");
+        for (String packageName : packages) {
+            try {
+                ApplicationInfo info = packageManager.getApplicationInfo(packageName, 0);
+                Uri uri = Uri.parse("tel:".equals(scheme) ? scheme + digits : scheme);
+                Intent intent = new Intent(action, uri);
+                if (!"tel:".equals(scheme)) {
+                    intent.putExtra(Intent.EXTRA_TEXT, value);
+                    intent.putExtra(Intent.EXTRA_SUBJECT, "");
+                }
+                intent.setPackage(packageName);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                out.add(ShareTarget.action(
+                        info.loadLabel(packageManager),
+                        info.loadIcon(packageManager),
+                        keyPrefix + ":" + packageName,
+                        packageName,
+                        intent));
+            } catch (Throwable ignored) {
+                // Try the next candidate.
+            }
+        }
+    }
+
+    private Drawable colorizedIcon(int resourceId) {
+        try {
+            return context.getDrawable(resourceId);
+        } catch (Throwable error) {
+            return null;
+        }
+    }
+
+    /**
+     * Runs the package query before the first drag so the first gesture after a fresh
+     * portal start is not paying for 100+ PackageManager icon loads.
+     */
+    void prewarmTargets() {
+        TARGET_QUERY_EXECUTOR.execute(() -> {
+            try {
+                if (cachedRawTargets(false) == null) {
+                    storeRawTargets(false, ShareTargetRepository.query(context, "text/plain"));
+                }
+                if (cachedRawTargets(true) == null) {
+                    storeRawTargets(true, ShareTargetRepository.query(context, "image/*"));
+                }
+                log("target prewarm finished");
+            } catch (Throwable error) {
+                log("target prewarm failed", error);
+            }
+        });
+    }
+
+    private List<ShareTarget> safeApplyTargets(List<ShareTarget> raw, boolean image) {
+        try {
+            return ShareTargetRepository.applySettings(context, raw, settings, image);
+        } catch (Throwable error) {
+            log("share target filter failed", error);
+            return new ArrayList<>();
+        }
+    }
+
+    private static List<ShareTarget> cachedRawTargets(boolean image) {
+        return image ? cachedImageTargets : cachedTextTargets;
+    }
+
+    private static void storeRawTargets(boolean image, List<ShareTarget> targets) {
+        if (targets == null) {
+            return;
+        }
+        if (image) {
+            cachedImageTargets = targets;
+        } else {
+            cachedTextTargets = targets;
         }
     }
 
@@ -712,6 +1107,17 @@ final class DragShareController {
         }
     }
     private void createMenu() {
+        if (shareTargets.isEmpty()) {
+            // The async target query may still be running. Never build an empty menu:
+            // an empty window would flash its placeholder text over the host app.
+            menuView = null;
+            menuParams = null;
+            menuScroll = null;
+            menuVerticalScroll = null;
+            menuRow = null;
+            modernMenuView = null;
+            return;
+        }
         if (isModernStyle()) {
             Map<ShareTarget, Drawable> icons = new LinkedHashMap<>();
             for (ShareTarget target : shareTargets) {
@@ -845,7 +1251,9 @@ final class DragShareController {
             }
         } else {
             int itemWidth = dp(portalStyle ? 78 : 76);
-            int itemHeight = dp(portalStyle ? 124 : 84);
+            int itemHeight = dp(portalStyle
+                    ? 124
+                    : (vertical ? VERTICAL_MENU_ITEM_HEIGHT_DP : 84));
             int iconSize = dp(portalStyle ? 50 : 44);
             for (ShareTarget target : shareTargets) {
                 LinearLayout item = new LinearLayout(context);
@@ -876,14 +1284,26 @@ final class DragShareController {
                                     ? 0xCC000000
                                     : 0x66000000);
                 }
-                item.addView(label, new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, dp(portalStyle ? 38 : 28)));
+                if (!vertical && !portalStyle) {
+                    item.addView(label, new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, dp(28)));
+                } else if (portalStyle) {
+                    item.addView(label, new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, dp(38)));
+                }
 
                 if (vertical) {
-                    int width = Math.max(dp(72), menuWidth - dp(8));
+                    // Dock layout: icon only, no caption, so the strip stays narrow.
+                    int width = Math.max(1, menuWidth - dp(8));
                     menuRow.addView(item, new LinearLayout.LayoutParams(width, itemHeight));
                 } else {
                     menuRow.addView(item, new LinearLayout.LayoutParams(itemWidth, itemHeight));
+                }
+                if (isCapsuleMenu()) {
+                    // OriginOS-style tile: caption above the icon.
+                    item.removeAllViews();
+                    item.addView(label);
+                    item.addView(icon);
                 }
                 menuItems.add(item);
             }
@@ -899,7 +1319,9 @@ final class DragShareController {
             return;
         }
         FrameLayout linearMenuView = (FrameLayout) menuView;
-        int cornerRadiusDp = settings.simpleMenuCornerRadiusDp;
+        int cornerRadiusDp = isCapsuleMenu()
+                ? Math.max(settings.simpleMenuCornerRadiusDp, 24)
+                : settings.simpleMenuCornerRadiusDp;
         View background = new View(context);
         background.setBackground(roundDrawable(
                 applyAbsoluteOpacity(palette.menuBackground, 100),
@@ -974,6 +1396,7 @@ final class DragShareController {
             return;
         }
         boolean menuOpenedNow = false;
+        updateBothSidesMenuSide(x);
         if (!menuShown && shouldShowSimpleMenu(x, y)
                 && hasQualifiedSimpleMenuActivation(x, y)) {
             showMenuOnMain();
@@ -987,16 +1410,58 @@ final class DragShareController {
                 return;
             }
             updateSelectedTarget(x, y);
-            boolean pointerInScrollableMenu = isPortalStyle()
-                    || isPointerInsideSimpleMenu(x, y);
+            edgeScrollOutsideMenu = false;
+            edgeScrollDepth = 0f;
             int nextDirection = 0;
-            if (pointerInScrollableMenu) {
-                int edgeAxisSize = edgeScrollAxisSize();
-                int edgeWidth = edgeScrollWidthPx();
+            if (isCapsuleMenu()) {
+                // Horizontal capsule: scroll from the inner bands of the capsule itself,
+                // not from the screen edges (the capsule sits centred, far from them).
+                int slop = dp(SIDE_MENU_SCROLL_LEAVE_SLOP_DP);
+                int innerBand = Math.max(dp(SIDE_MENU_INNER_SCROLL_BAND_DP), 1);
+                float rightInner = menuLeft + menuWidth - innerBand;
+                float leftInner = menuLeft + innerBand;
+                if (x > menuLeft + menuWidth + slop) {
+                    nextDirection = 1;
+                    edgeScrollOutsideMenu = true;
+                    edgeScrollDepth = 1f;
+                } else if (x > rightInner) {
+                    nextDirection = 1;
+                    edgeScrollDepth = Math.min(1f, (x - rightInner) / innerBand);
+                } else if (x < menuLeft - slop) {
+                    nextDirection = -1;
+                    edgeScrollOutsideMenu = true;
+                    edgeScrollDepth = 1f;
+                } else if (x < leftInner) {
+                    nextDirection = -1;
+                    edgeScrollDepth = Math.min(1f, (leftInner - x) / innerBand);
+                }
+            } else if (isVerticalSimpleMenu()) {
+                // Dock scrolling starts as soon as the pointer reaches the last visible
+                // tile, not after leaving the card entirely.
+                int slop = dp(SIDE_MENU_SCROLL_LEAVE_SLOP_DP);
+                int innerBand = Math.max(dp(SIDE_MENU_INNER_SCROLL_BAND_DP), 1);
+                float bottomInner = menuTop + menuHeight - innerBand;
+                float topInner = menuTop + innerBand;
+                if (y > menuTop + menuHeight + slop) {
+                    nextDirection = 1;
+                    edgeScrollOutsideMenu = true;
+                    edgeScrollDepth = 1f;
+                } else if (y > bottomInner) {
+                    nextDirection = 1;
+                    edgeScrollDepth = Math.min(1f, (y - bottomInner) / innerBand);
+                } else if (y < menuTop - slop) {
+                    nextDirection = -1;
+                    edgeScrollOutsideMenu = true;
+                    edgeScrollDepth = 1f;
+                } else if (y < topInner) {
+                    nextDirection = -1;
+                    edgeScrollDepth = Math.min(1f, (topInner - y) / innerBand);
+                }
+            } else if (isPortalStyle() || isPointerInsideSimpleMenu(x, y)) {
                 nextDirection = GestureMath.edgeScrollDirection(
-                        isVerticalSimpleMenu() ? y : x,
-                        edgeAxisSize,
-                        edgeWidth);
+                        x,
+                        edgeScrollAxisSize(),
+                        edgeScrollWidthPx());
             }
             if (nextDirection != edgeDirection) {
                 edgeDirection = nextDirection;
@@ -1069,6 +1534,15 @@ final class DragShareController {
     }
 
     private int effectiveSimpleMenuPosition() {
+        if (configuredSimpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES) {
+            // The side is chosen per pointer position in updateBothSidesMenuSide(); start left
+            // so the first layout pass still builds a vertical list.
+            return DragShareSettings.SIMPLE_MENU_POSITION_LEFT;
+        }
+        if (configuredSimpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE) {
+            // The capsule hangs under the status bar; reuse the top-edge trigger semantics.
+            return DragShareSettings.SIMPLE_MENU_POSITION_TOP;
+        }
         if (configuredSimpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_NEAR_HAND) {
             return nearHandSide == DragShareSettings.SIMPLE_MENU_POSITION_LEFT
                     ? DragShareSettings.SIMPLE_MENU_POSITION_LEFT
@@ -1084,6 +1558,11 @@ final class DragShareController {
         return !isPortalStyle()
                 && (simpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_LEFT
                 || simpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_RIGHT);
+    }
+
+    private boolean isCapsuleMenu() {
+        return configuredSimpleMenuPosition
+                == DragShareSettings.SIMPLE_MENU_POSITION_CAPSULE;
     }
 
     private int edgeScrollAxisSize() {
@@ -1105,7 +1584,34 @@ final class DragShareController {
                 dp(EDGE_SCROLL_FULL_SPEED_INSET_DP));
     }
 
+    private float edgeScrollMultiplierForCurrentGesture() {
+        float multiplier = edgeScrollSpeedMultiplier();
+        if (edgeScrollOutsideMenu) {
+            return Math.max(1.2f, multiplier) * 0.8f;
+        }
+        if (edgeScrollDepth > 0f) {
+            // Ramp in quickly from the inner band so a small overshoot already moves
+            // the list at a usable speed.
+            return Math.max(0.9f, multiplier) * (0.9f + 0.9f * edgeScrollDepth) * 0.8f;
+        }
+        return multiplier * 0.8f;
+    }
+
+    private void fadeInCapsuleIfNeeded() {
+        if (!isCapsuleMenu() || menuView == null) {
+            return;
+        }
+        menuView.animate().cancel();
+        menuView.setAlpha(0f);
+        menuView.animate().alpha(1f).setDuration(150L).start();
+    }
+
     private boolean shouldShowSimpleMenu(float x, float y) {
+        if (isCapsuleMenu()) {
+            // The capsule is the drag surface itself: it is visible for the whole
+            // gesture instead of waiting for the finger to reach the top edge.
+            return true;
+        }
         if (isPortalStyle()) {
             return GestureMath.shouldShowMenu(y, menuTriggerTop);
         }
@@ -1125,6 +1631,11 @@ final class DragShareController {
 
     private boolean hasQualifiedSimpleMenuActivation(float x, float y) {
         if (isPortalStyle() || isCircleStyle() || simpleMenuActivationQualified) {
+            return true;
+        }
+        if (isBothSidesSimpleMenu()) {
+            // The side band itself is the gate: entering it is already an explicit move
+            // toward the edge, and switching sides must not require a fresh slop again.
             return true;
         }
         if (!simpleMenuStartPointCaptured) {
@@ -1200,6 +1711,43 @@ final class DragShareController {
         }
         int nextPosition = effectiveSimpleMenuPosition();
         if (nextPosition == simpleMenuPosition) {
+            return;
+        }
+        switchSimpleMenuSide(nextPosition);
+    }
+
+    private boolean isBothSidesSimpleMenu() {
+        return !isPortalStyle() && !isCircleStyle()
+                && configuredSimpleMenuPosition
+                == DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES;
+    }
+
+    private int simpleMenuTriggerPx() {
+        return Math.max(dp(settings.edgeTriggerDp), dp(MENU_TRIGGER_DP));
+    }
+
+    /**
+     * Keeps the "two sides" position in sync with the pointer: the vertical menu follows
+     * whichever edge band the pointer enters, and a centred pointer hides it again.
+     */
+    private void updateBothSidesMenuSide(float x) {
+        if (!isBothSidesSimpleMenu()) {
+            return;
+        }
+        int side = GestureMath.nearestSideEdge(x, screenWidth, simpleMenuTriggerPx());
+        if (side == -1) {
+            if (menuShown) {
+                hideLinearMenu();
+            }
+            return;
+        }
+        if (side != simpleMenuPosition) {
+            switchSimpleMenuSide(side);
+        }
+    }
+
+    private void switchSimpleMenuSide(int nextPosition) {
+        if (!active || nextPosition == simpleMenuPosition) {
             return;
         }
         boolean wasShown = menuShown;
@@ -1298,6 +1846,7 @@ final class DragShareController {
                 return;
             }
             menuShown = true;
+            fadeInCapsuleIfNeeded();
             circleEdge = circlePendingEdge;
             circleScrollDirection = 0;
             circleMenuView.expand(circleEdge, lastX, lastY);
@@ -1325,6 +1874,7 @@ final class DragShareController {
             cancelLinearMenuFadeOut(menuView);
             menuView.animate().cancel();
             menuShown = true;
+            fadeInCapsuleIfNeeded();
             menuView.animate()
                     .alpha(1f)
                     .translationX(0f)
@@ -1342,6 +1892,7 @@ final class DragShareController {
                 && ((modernMenuWindow != null && modernMenuWindow.isShowing())
                 || menuView.isAttachedToWindow())) {
             menuShown = true;
+            fadeInCapsuleIfNeeded();
             if (modernMenuWindow != null) {
                 modernMenuWindow.showAnimated();
             } else {
@@ -1359,6 +1910,7 @@ final class DragShareController {
                 windowManager.addView(menuView, menuParams);
             }
             menuShown = true;
+            fadeInCapsuleIfNeeded();
             updatePreviewPosition(lastX, lastY);
             log("menu shown pointerY=" + Math.round(lastY) + " menuTop=" + menuTop);
             if (isPortalStyle()) {
@@ -1526,6 +2078,7 @@ final class DragShareController {
     }
 
     private void finishGestureOnMain(boolean allowShare, Runnable afterDeactivate) {
+        mainHandler.removeCallbacks(stuckSessionCheck);
         if (!active) {
             return;
         }
@@ -1540,6 +2093,7 @@ final class DragShareController {
             log("background scroll lock skipped because root input was not active");
         }
         active = false;
+        stopBoostPulse();
         stopEdgeScroll();
         backgroundTouchBlocker.stop();
         if (afterDeactivate != null) {
@@ -1565,15 +2119,61 @@ final class DragShareController {
     }
 
     private void cancelGestureOnMain() {
+        mainHandler.removeCallbacks(stuckSessionCheck);
         if (!active) {
             return;
         }
         active = false;
+        stopBoostPulse();
         stopEdgeScroll();
         backgroundTouchBlocker.stop();
         removeGestureViews(true);
         if (session != null && session.pendingTarget == null) {
             session.cancelled = true;
+        }
+    }
+
+    private void launchActionTarget(Session shareSession, ShareTarget target) {
+        shareSession.cancelled = true;
+        try {
+            Intent intent = target.actionIntent();
+            if (intent == null) {
+                return;
+            }
+            context.startActivity(intent);
+            log("action target=" + target.key());
+        } catch (Throwable error) {
+            log("action target failed key=" + target.key(), error);
+            showToast("无法打开 " + target.label);
+        }
+    }
+
+    private void openSystemShare(Session shareSession) {
+        try {
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType(shareSession.payload.mimeType());
+            send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (shareSession.payload.isImage()) {
+                Uri uri = shareSession.stagedUri;
+                if (uri == null) {
+                    showToast("图片还没有准备好");
+                    return;
+                }
+                send.putExtra(Intent.EXTRA_STREAM, uri);
+                send.setData(uri);
+                send.setClipData(ClipData.newUri(
+                        context.getContentResolver(), "drag-share-image", uri));
+                send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } else {
+                send.putExtra(Intent.EXTRA_TEXT, shareSession.payload.text);
+            }
+            Intent chooser = Intent.createChooser(send, "分享到");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(chooser);
+            log("system share sheet opened");
+        } catch (Throwable error) {
+            log("unable to open system share sheet", error);
+            showToast("无法打开系统分享");
         }
     }
 
@@ -1588,6 +2188,15 @@ final class DragShareController {
     }
 
     private void launchShare(Session shareSession, ShareTarget target) {
+        if (target.isActionTarget()) {
+            launchActionTarget(shareSession, target);
+            return;
+        }
+        if (target.isSystemShare()) {
+            openSystemShare(shareSession);
+            shareSession.cancelled = true;
+            return;
+        }
         if (target.isSaveToLocal()) {
             saveImageLocally(shareSession.payload.bitmap);
             shareSession.cancelled = true;
@@ -1654,6 +2263,35 @@ final class DragShareController {
             showToast("没有可分词的文字");
             return;
         }
+        closeSegmentation();
+        try {
+            final SegmentationOverlay[] holder = new SegmentationOverlay[1];
+            holder[0] = new SegmentationOverlay(
+                    context,
+                    windowPolicy,
+                    settings != null && settings.colorMode == DragShareSettings.COLOR_DARK,
+                    text,
+                    Math.round(lastX),
+                    Math.round(lastY),
+                    () -> {
+                        if (segmentationOverlay == holder[0]) {
+                            segmentationOverlay = null;
+                            Runnable listener = segmentationClosedListener;
+                            if (listener != null) {
+                                listener.run();
+                            }
+                        }
+                    });
+            segmentationOverlay = holder[0];
+            holder[0].show();
+            log("opened text segmentation overlay");
+        } catch (Throwable error) {
+            log("open text segmentation overlay failed; falling back to activity", error);
+            openTextSegmentationActivity(text);
+        }
+    }
+
+    private void openTextSegmentationActivity(String text) {
         try {
             Intent intent = TextSegmentationActivity.createIntent(
                     text,
@@ -1661,10 +2299,29 @@ final class DragShareController {
                     Math.round(lastY));
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             context.startActivity(intent);
-            log("opened text segmentation");
+            log("opened text segmentation activity");
         } catch (Throwable error) {
             log("open text segmentation failed", error);
             showToast("无法打开文本分词");
+        }
+    }
+
+    /** Keeps the portal service alive while the segmentation window is open. */
+    boolean hasOpenSegmentation() {
+        return segmentationOverlay != null;
+    }
+
+    /** The portal hooks flush a deferred stopSelf through this callback. */
+    void setSegmentationClosedListener(Runnable listener) {
+        segmentationClosedListener = listener;
+    }
+
+    void closeSegmentation() {
+        SegmentationOverlay overlay = segmentationOverlay;
+        if (overlay != null) {
+            // close() invokes onClosed, which clears the field and flushes a pending
+            // portal stopSelf; do not clear the field before that identity check.
+            overlay.close();
         }
     }
 
@@ -1767,6 +2424,41 @@ final class DragShareController {
         }
     }
 
+    private void startBoostPulse() {
+        mainHandler.removeCallbacks(boostPulseRunnable);
+        mainHandler.postDelayed(boostPulseRunnable, BOOST_PULSE_INTERVAL_MS);
+    }
+
+    private void stopBoostPulse() {
+        mainHandler.removeCallbacks(boostPulseRunnable);
+    }
+
+    private void pulseBoost() {
+        ModernOverlayWindow modernWindow = modernPreviewWindow;
+        if (modernWindow != null) {
+            modernWindow.pulseBoost();
+            return;
+        }
+        View view = previewView;
+        if (view == null) {
+            return;
+        }
+        view.animate().cancel();
+        view.animate()
+                .scaleX(1.004f)
+                .scaleY(1.004f)
+                .setDuration(80L)
+                .withEndAction(() -> {
+                    View current = previewView;
+                    if (current == null) {
+                        return;
+                    }
+                    current.animate().cancel();
+                    current.animate().scaleX(1f).scaleY(1f).setDuration(80L).start();
+                })
+                .start();
+    }
+
     private void updatePortalPullEffect(float x, float y) {
         if (glowView == null || !isPortalStyle()) {
             return;
@@ -1822,12 +2514,41 @@ final class DragShareController {
             return;
         }
 
-        simpleMenuPosition = effectiveSimpleMenuPosition();
+        if (isCapsuleMenu()) {
+            // OriginOS-like capsule: compact, centred, pinned under the status bar.
+            int capsuleWidth = Math.min(
+                    Math.max(1, screenWidth - dp(24)),
+                    dp(CAPSULE_WIDTH_DP));
+            menuWidth = Math.max(1, capsuleWidth);
+            menuHeight = dp(CAPSULE_HEIGHT_DP);
+            menuLeft = Math.max(0, (screenWidth - menuWidth) / 2);
+            // Sit on the status-bar / dynamic-island line instead of below it.
+            menuTop = Math.max(0, topInset - dp(24));
+            menuTriggerTop = menuTop + menuHeight;
+            return;
+        }
+
+        if (configuredSimpleMenuPosition
+                == DragShareSettings.SIMPLE_MENU_POSITION_BOTH_SIDES) {
+            // The pointer decides the side for each layout pass; never reset it to left
+            // here or a side switch would immediately undo itself.
+            if (simpleMenuPosition != DragShareSettings.SIMPLE_MENU_POSITION_LEFT
+                    && simpleMenuPosition != DragShareSettings.SIMPLE_MENU_POSITION_RIGHT) {
+                simpleMenuPosition = DragShareSettings.SIMPLE_MENU_POSITION_LEFT;
+            }
+        } else {
+            simpleMenuPosition = effectiveSimpleMenuPosition();
+        }
         int menuMargin = dp(settings.simpleMenuEdgeDistanceDp);
         if (isVerticalSimpleMenu()) {
             menuWidth = Math.min(dp(SIMPLE_SIDE_MENU_WIDTH_DP), Math.max(1, screenWidth / 2));
-            menuHeight = Math.max(1, screenHeight - topInset - bottomInset);
-            menuTop = topInset;
+            int availableHeight = Math.max(1, screenHeight - topInset - bottomInset);
+            int contentHeight = shareTargets.size() * dp(VERTICAL_MENU_ITEM_HEIGHT_DP) + dp(16);
+            int minHeight = dp(VERTICAL_MENU_MIN_HEIGHT_DP);
+            int maxHeight = Math.max(minHeight,
+                    availableHeight * VERTICAL_MENU_MAX_HEIGHT_PERCENT / 100);
+            menuHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
+            menuTop = topInset + Math.max(0, (availableHeight - menuHeight) / 2);
             menuLeft = simpleMenuPosition == DragShareSettings.SIMPLE_MENU_POSITION_LEFT
                     ? menuMargin
                     : Math.max(0, screenWidth - menuWidth - menuMargin);
@@ -1869,6 +2590,7 @@ final class DragShareController {
         params.setTitle(title);
         params.layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        DisplayRefreshRate.applyParams(params, context);
         return params;
     }
 
@@ -1877,6 +2599,7 @@ final class DragShareController {
     }
 
     private void removeGestureViews(boolean animatePreviewExit) {
+        stopBoostPulse();
         unregisterNearHandSensor();
         cancelModernMenuDispose();
         cancelLinearMenuFadeOut();
@@ -2149,6 +2872,7 @@ final class DragShareController {
 
     private void stopEdgeScroll() {
         edgeDirection = 0;
+        edgeScrollOutsideMenu = false;
         circleScrollDirection = 0;
         lastEdgeScrollUptime = 0L;
         edgeScrollRemainderPx = 0f;

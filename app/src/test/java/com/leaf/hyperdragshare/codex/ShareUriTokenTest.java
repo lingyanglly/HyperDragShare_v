@@ -17,7 +17,7 @@ public final class ShareUriTokenTest {
 
     @Test
     public void createsPngFileNameAndRetainsLegacySuffixMetadata() {
-        assertEquals(TOKEN + ".png", ShareUriToken.fileName(TOKEN));
+        assertEquals(TOKEN + ".png", ShareUriToken.fileName(TOKEN, ShareUriToken.PNG_SUFFIX));
         assertEquals(".png", ShareUriToken.suffix(TOKEN + ".png"));
         assertEquals(".jpg", ShareUriToken.suffix(TOKEN + ".jpg"));
         assertEquals(".jpg", ShareUriToken.suffix(TOKEN));

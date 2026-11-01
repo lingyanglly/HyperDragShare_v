@@ -151,6 +151,34 @@ final class ShareTargetRepository {
         return result;
     }
 
+    /**
+     * Collapses the runtime menu to one tile per application. Address/phone/email payloads
+     * prepend an explicit action tile (geo:/tel:/mailto:), and the same app can also resolve
+     * as a normal ACTION_SEND target; keeping both showed 高德/百度 twice. Built-in actions
+     * (copy/save/segmentation/system share) use the "builtin" package and are all kept.
+     */
+    static List<ShareTarget> dedupeByPackage(List<ShareTarget> targets) {
+        if (targets == null) {
+            return null;
+        }
+        List<ShareTarget> result = new ArrayList<>(targets.size());
+        Set<String> seenPackages = new HashSet<>();
+        for (ShareTarget target : targets) {
+            if (target == null) {
+                continue;
+            }
+            String packageName = target.packageName();
+            if (packageName == null || packageName.isEmpty() || "builtin".equals(packageName)) {
+                result.add(target);
+                continue;
+            }
+            if (seenPackages.add(packageName)) {
+                result.add(target);
+            }
+        }
+        return result;
+    }
+
     /** Orders all installed targets for the settings screen, preserving newly discovered apps. */
     static List<ShareTarget> orderForSettings(
             List<ShareTarget> queried,

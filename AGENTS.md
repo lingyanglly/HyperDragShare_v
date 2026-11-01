@@ -9,8 +9,10 @@
 ## 工程基线
 
 - 工程类型：Android LSPosed 模块，Java/Kotlin 17，minSdk 33，targetSdk 34，compileSdk 37。
-- 当前版本：`1.7.47`，`versionCode 71`。
-- 已验证宿主：传送门 `4.2.1`，包名 `com.miui.contentextension`。
+- 当前版本：`1.11.0`，`versionCode 110`。
+- 已验证宿主：传送门 `4.2.1` 与 `5.1.5`（`50015`，Android 17 / HyperOS 4.0），包名
+  `com.miui.contentextension`。5.1.5 只完成 DEX 静态符号核对（含
+  `observe_control_event` 的 `257`/`258` 字符串），实机注入与拖拽仍须以 logcat 证据为准。
 - LSPosed API：82，入口为 `com.leaf.hyperdragshare.codex.MainHook`。
 - 可靠的同手势跟手依赖 root 读取 Linux evdev；MIUI 输入监听仅作回退。
 - 当前设备记录：`Xiaomi_Touch_Input_0`、`/dev/input/event7`、原始范围
@@ -77,6 +79,10 @@
 - `CircleMenuOverlayView.java`、`CircleMenuGeometry.java`：按 JADX MCP 圆菜单类重建的左右贴边半圆样式。
 - `ModernOverlayViews.kt`、`ModernOverlayWindow.java`、`ModernPreviewSizer.java`：现代 Compose 内容、View outline、公开 Window 局部背景模糊和自适应正方形预览。
 - `DragShareSettings.java`：设置默认值、范围校验、本地持久化和 Provider 配置 RPC。
+- `RootInputService.java`、`RootEventClient.java`、`RootHelperPrefs.java`、`BootReceiver.java`：
+  模块进程常驻 evdev 前台服务、传送门侧 Messenger 订阅、开关持久化和开机自启。helper 不可用时
+  传送门保留本地 evdev 回退；首笔无输入帧时 `DragShareController` 在收到第一帧时立即接管
+  （最长等待 3 s，观察到 `UP`/`CANCEL` 立即放弃）。
 - `BackgroundTouchBlocker.java`、`FrameworkBinderTransactionResolver.java`：可选地通过系统手势监视器取消原前台窗口的触摸流；直接 API 被拒绝或被隐藏 API 策略屏蔽时，从当前 ROM 的 framework DEX 动态解析输入 Binder 事务号并以 root 回退，失败时旁路观察。
 - `SettingsScreen.kt`：Miuix 设置页（内容开关、目标可见性、批量操作、拖拽排序、外观和触摸参数）。
 - `ModuleActivation.java`：Root 探测、当前版本传送门注入握手和首页激活状态来源。
@@ -104,7 +110,7 @@
 .\gradlew.bat testDebugUnitTest lintDebug assembleDebug
 ```
 
-当前应有 75 个单元测试通过，APK 输出到
+当前应有 82 个单元测试通过，APK 输出到
 `app\build\outputs\apk\debug\app-debug.apk`。交付新的可安装行为时同步递增
 `versionCode` 和 `versionName`；纯文档修改不要求增版。
 

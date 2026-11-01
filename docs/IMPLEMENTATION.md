@@ -1,6 +1,6 @@
 # HyperDragShare 完整实现说明
 
-本文记录 HyperDragShare `1.7.48`（`versionCode 72`）的当前完整实现、关键兼容性选择和已验证
+本文记录 HyperDragShare `1.10.8`（`versionCode 101`）的当前完整实现、关键兼容性选择和已验证
 设备参数。实现目标是：传送门识别长按文字或图片后，在手指附近立即显示预览；同一根手指
 无需抬起即可继续拖动；简洁和现代样式可按设置出现在上、下、左、右或近手侧，流光样式在底部显示横向分享菜单，环形样式可从左右边缘展开半圆
 菜单；停留在可滚动热区时自动滚动；松手落在目标上时直接分享。
@@ -53,6 +53,7 @@ Root/MIUI 输入源；已连接的无障碍服务收到无障碍模式时才启�
 | `PortalHooks.java` | 传送门 Hook、生命周期、输入源仲裁、取消信号处理 |
 | `RootTouchSource.java`、`EvdevTouchParser.java` | evdev 发现、解析、稳定主触点和 DOWN/MOVE/UP/CANCEL |
 | `MiuiMotionSource.java` | MIUI MotionEvent 回退通道 |
+| `RootInputService.java`、`RootEventClient.java`、`RootHelperPrefs.java`、`BootReceiver.java` | 模块进程常驻 evdev 前台服务、传送门侧 Messenger 订阅、开关持久化和开机自启 |
 | `CapturedContent.java`、`OverlayWindowPolicy.java` | 来源无关的文字/图片模型和窗口类型策略 |
 | `DragShareController.java` | 会话状态、悬浮窗、菜单、落点与分享调度；不依赖 Xposed |
 | `PortalGlowView.java` | 流光样式全屏光效、向下进度和托盘展开动画 |
@@ -68,7 +69,7 @@ Root/MIUI 输入源；已连接的无障碍服务收到无障碍模式时才启�
 | `DragShareAccessibilityService.java`、`AccessibilityContentCaptureSource.java` | 无障碍生命周期、Root 长按协调和来源隔离 |
 | `AccessibilityBlacklist.java` | 动态内置排除（当前桌面、默认输入法）和用户应用黑名单判定 |
 | `LongPressGestureDetector.java`、`AccessibilityNodeClassifier.java`、`AccessibilityCandidateSelector.java` | 可单测的长按、节点分类和触点选择 |
-| `AccessibilityScreenshotter.java`、`RootScreenshotter.java`、`ScreenshotRectMapper.java` | API 30+ 无障碍区域截图及 API 28/29 Root 回退 |
+| `AccessibilityScreenshotter.java`、`RootScreenshotter.java`、`ScreenshotRectMapper.java` | API 30+ 无障碍区域截图及内部错误时的 Root 回退 |
 | `ShareTargetRepository.java` | 查询可分享 Activity，并注入复制、保存和文本分词内置动作 |
 | `BitmapEncoder.java` | 将 Bitmap 无损编码为 PNG |
 | `ImageStagingClient.java` | 从传送门进程调用模块 Provider |
@@ -94,6 +95,15 @@ Root/MIUI 输入源；已连接的无障碍服务收到无障碍模式时才启�
    `observe_control_event`，并过滤会误终止拖拽的控制消息。
 6. `cancelTask()`：无可靠 root 输入时沿用宿主取消；root 拖拽活动时暂存并阻止原调用，
    等真实 UP 后再回放原方法。
+7. 主机取词就绪标记（1.10.13）：DEX 语义核对（5.1.5）：
+   `sIsTaskFinished == true` 才把新结果路由进主机的 `onStartPick` 取词管线
+   （`false` 则只处理 `observe_control_event` 257/258 的 `quitByDefault` 退出），
+   `onStartPick` 内部同样要求该标志为 true；`startPick*Task()` 置 false（任务进行中），
+   `cancelTask()`/`quitByDefault()` 置 true（任务结束、可接下一手）。模块接管拖拽后
+   标志可能停在 false，主机随后会把下一手的内容当“任务进行中”静默丢弃（1.10.11 曾误判
+   语义、无条件清 false，导致“只有第一手能拖”）。修复：`handleCallback()` 对既非
+   MotionEvent 又非控制事件的回调（即取词内容）执行 `setIsTaskFinished(true)`，
+   让主机自己的 `onStartPick` 照常取词；控制事件路由与拖拽后状态不碰。
 
 `PortalContentCaptureSource.capture()` 先读取传送门静态字段 `sIsTextMode` 和 `sContent`。
 不是有效文字时，再调用传送门的静态 `getBitmap()`，并输出不依赖 Xposed 的
@@ -156,6 +166,15 @@ WindowManager 不会把正在进行的手势重新定向给新窗口。因此，
    抬起时，用最后坐标输出 ACTION_UP。
 7. `GestureMath.mapRawPoint()` 先归一化，再按屏幕真实像素及 rotation 0/1/2/3 映射。
 
+读取器可能在手指已经按下之后才启动（传送门和模块都冷启动时）。Type-B 触摸驱动只在按下沿
+报告 `ABS_MT_TRACKING_ID`，之后静止期间没有事件；读取器启动后的第一帧往往只有
+`ABS_MT_POSITION_X/Y`，既没有 tracking id 也没有 `BTN_TOUCH` 下降沿。解析器的
+`adoptsInFlightStroke` 会在这种仅有坐标的帧上接管进行中的触摸，用当前坐标合成一个
+`ACTION_DOWN`，并把该 slot 记为“已接管”；后续 MOVE 正常输出，直到真实 tracking id 或
+`-1`/`BTN_TOUCH=0` 结束。这样双冷启动时第一次拖动也能在移动的第一帧进入跟手链路。
+实机（1.10.5，双冷启动、长按约 1.7 s 后慢拖）已验证：`frames=1` 合成 DOWN → 首帧接管 →
+`preview shown` → `input source=root` → `gesture finished`。
+
 当前实机探测值是：
 
 ```text
@@ -177,6 +196,84 @@ ABS 最大值：121999 x 265599
 root 输入线程使用阻塞式读取，不是高频定时轮询；它随传送门服务生命周期存在，主要开销是一个
 等待内核事件的线程，空闲时不会持续计算坐标。近手方向的旋转向量/加速度传感器则只在启用
 该选项且拖拽会话活动期间注册，松手、取消或服务销毁时立即注销。
+
+### 5.1 常驻输入 helper 与首笔宽限（1.9.9+）
+
+`RootInputService` 是模块进程里的前台服务（`START_STICKY`、`dataSync` 类型），由
+`DragShareApplication` 在开关开启时启动，`BootReceiver` 在 `BOOT_COMPLETED` 后再兜底一次。
+服务持有 evdev 读取线程：客户端用一次 one-way `transact`（`TRANSACTION_SUBSCRIBE`）提交自己的
+`Messenger`，服务端之后只用 `MSG_POINTER`（action/x/y/eventTime）回传事件。`onBind()` 本身不做
+UID 判断——它由主线程消息分发，`Binder.getCallingUid()` 在那里只会返回本进程；真正的门禁在
+自定义 `Binder.onTransact()` 里，用当时的 `Binder.getCallingUid()` 只放行模块自身和传送门 UID，
+其余订阅直接返回 `false`。`ROOT_INPUT` 权限只是历史声明，系统签名的传送门不会请求它，因此
+不能作为安全边界。
+
+传送门进程内的 `RootEventClient` 用显式组件名绑定服务，`BIND_AUTO_CREATE` 保证服务未运行时也
+能被拉起；订阅成功后断线每 800 ms 重试。它同时观察设置 URI，按 `get_settings` 返回的
+`root_helper_enabled` 决定是否 bind（关闭开关会立即 unbind 并触发本地回退）。
+`PortalHooks.dispatchRootPointer()` 仍是唯一事件漏斗，
+helper 和本地 `RootTouchSource` 都复用同一条路径。运行时先同时启动两者；helper 一旦订阅成功就
+立即停掉本地 pipe（`root helper connected; local evdev stopped`），1200 ms 的
+`settleInputSource()` 只作为兜底：helper 已连接时同样停本地，未连接时启动本地
+（`root helper unavailable; staying on local evdev`）。helper 连接后异常死亡时
+`onServiceDisconnected` 会重新拉起本地 pipe（`root helper disconnected; restarting local evdev`），
+下一次重连成功后再切回 helper，避免断线后整个进程没有输入源。
+
+冷启动首笔原本会因为“没有任何输入帧”直接跳过接管。实测发现固定 250 ms 宽限并不可靠：
+长按后手指静止时 evdev 不会产生新帧，首帧往往在开始拖动时才出现，250 ms 早已过期。
+因此分两层处理：
+
+- `RootInputService` 在新订阅者加入时，如果最后一条事件仍是 `DOWN`/`MOVE`，立即向该订阅者
+  重放一次当前指针状态。传送门在长按中途完成订阅就能马上拿到输入帧，不必等手指移动。
+- `DragShareController.showOnMain()` 在没有输入帧时不再固定等待 250 ms，而是把 `startPick`
+  参数暂存为“延迟接管”，保留原浮窗抑制；`acceptPointerEvent()` 收到第一帧时立即在主线程序号
+  校验后接管，用最新观察点建会话。最长等待 `3000 ms` 作为清理兜底，超时才回落到原来的跳过
+  日志；只要最新观测到 `UP`/`CANCEL` 就立即放弃，不再依赖时间戳比较，避免手势结束后补画。
+  请求序号用于识别更新的 `startPick`。该逻辑只作用于传送门路径，不影响无障碍自身的 Root 就绪。
+  双冷启动时传送门的原生 `SplashFloatView`（即用户看到的“T 文本识别” chip）会在首帧到达前就
+  `addToWindow`（读取器要等手指移动才有帧），因此原版识图会先出现。延迟接管真正建立会话后，
+  模块从服务的 `mSplashFloatView` 字段反射调用 `hideSplashFloatView(false)`：布尔参数是
+  `isCancelTask`，传 `true` 是传送门自己的退出路径、会触发 `cancelTask` 把会话也带走，所以必须传
+  `false` 只隐藏不结束任务。`mMainFloatView`（大识屏面板）的 `hideMainFloatView()` 必然
+  cancelTask，因此不做处理；它通常在 `addToWindow` 时就被抑制。helper 已热时首帧在 `startPick`
+  之前就已证明输入，原浮窗在 `addToWindow` 时被抑制，不会出现双窗。
+  实机（1.10.3，强停传送门后首笔）已验证：订阅重放 `ACTION_MOVE` → 首帧接管 → `preview shown`
+  → `input source=root` → `gesture finished source=root`，`control-257` 延迟到 UP 后回放。
+
+### 5.2 首笔唤醒与输入管道自愈（1.10.10）
+
+设备空闲一段时间后，第一手拖放可能要 2 s 以上才出现，且传送门一旦被唤醒，拖放立刻
+触发（迟到的 DOWN 让长按计时直接满足）。旧实现全程 one-way `Messenger.send()`：传送门被
+冻结或回收时帧只在队列里排队，等系统自行解冻。1.10.10 改为三层自愈：
+
+- **每手唤醒踢脚**：`RootInputService` 在每一手第一笔 `DOWN` 时另起后台线程执行一次 root
+  命令（同手势内 2 s 去重）：进程还活着就 `cmd activity make-uid-active <portalUid>` 解冻
+  UID；`pidof` 为空说明进程已被回收，先
+  `am start-service -n com.miui.contentextension/...TextContentExtensionService` 提前拉起
+  传送门（服务类名与 `PortalHooks.SERVICE_CLASS` 一致，命令失败只记日志不回滚）。踢脚完全
+  异步，evdev 读取线程从不阻塞，帧照常按顺序 one-way 投递：冻结期间排队的帧在解冻后立即
+  被处理，长按结束时传送门已经是热的。3 s 超时销毁 su。
+- **管道死亡自动重启**：`RootTouchSource` 的 `su cat` 管道在闲置期可能被 ROM 进程管理拆掉
+  （旧代码 EOF 后直接退出，之后整手无帧）。现在流意外结束后 2 s 自动重跑设备发现与打开；
+  发现/打开失败（例如 root 被撤销）不进入重试，避免空转刷 su。模块与传送门两侧共用该实现。
+- **传送门侧静默回退**：helper 连接还在但 400 ms 无帧时（模块管道死亡而连接未断），
+  `dispatchMotion()` 在跟随 MIUI 运动的同时启动本地 evdev 管道；helper 帧恢复后
+  `dispatchHelperPointer()` 立即停掉本地管道，防止双源重复帧。
+
+配套日志：`scheduling portal wake kick` → `portal wake kick finished exit=N`、
+`input stream ended unexpectedly; restarting discovery in 2000ms`、
+`root stream silent; starting local evdev as fallback`。
+
+1.10.11 实机补强（`hds-diag-1110.log` 证据）：
+
+- HyperOS 没有 `cmd activity make-uid-active`（`Unknown command`）也没有
+  `/sys/fs/cgroup/frozen`，踢脚里真正有效的是 `pidof` 为空时 `am start-service` 拉起
+  传送门（DOWN 后约 550 ms 进程就绪，首笔接管约 0.9 s）；该命令已从踢脚移除，避免每次
+  手势都跑无效命令。
+- 模块进程仍可能被回收（回收后踢脚就不存在了）：`RootInputService` 用
+  `AlarmManager.setAndAllowWhileIdle` 自排 15 分钟心跳（`PendingIntent.getService`），
+  每次启动续排下一次；设置开关关闭时 `onStartCommand` 直接 `stopSelf`。`startForeground`
+  包 try/catch，防止后台启动限制把复活路径变成崩溃。
 
 ## 6. 悬浮预览与底部菜单
 
@@ -264,7 +361,11 @@ DecorView。入场和退场动画直接作用于 DecorView，因此 Card 内容�
 现代菜单由自身的窗口退出动画收起。流光样式在屏幕底部约 `96 dp` 的热区展开，收起时光效从
 托盘展开态平滑退回当前下拉进度。
 `ShareTargetRepository` 以当前 MIME 构造 `ACTION_SEND`，查询默认且 exported 的 Activity，
-去重后加载图标和名称，按菜单方向选择横向或纵向滚动容器。“复制文本”和“复制图片”分别是
+去重后加载图标和名称，按菜单方向选择横向或纵向滚动容器。地址、电话、邮件这类 payload 会先由
+`DragShareController.buildActionTargets()` 加入 `geo:`/`tel:`/`mailto:` 动作磁贴；同一应用的
+普通 `ACTION_SEND` 目标随后会被 `dedupeByPackage()` 按包名折叠，只保留先出现的动作磁贴，避免
+高德/百度这类应用在菜单里出现两次。内置动作使用 `builtin` 包名，不受折叠影响。“复制文本”和
+“复制图片”分别是
 文字与图片菜单的内置首项；图片菜单随后是“保存到本地”，文字菜单随后是“文本分词”。文字复制
 使用普通文本剪贴板，图片复制会等待 PNG 暂存完成后以 `ClipData.newUri()` 写入可读取的图片 URI。
 两个复制项在“菜单可见性”页独立控制，所有内置动作也都遵守菜单可见性设置；保存/分词不会出现
@@ -326,6 +427,46 @@ MCP 还会对截图背景做 `500 ms` 的缩放/平移动画，并在部分设�
 当前模块不能安全接管传送门的 Surface，因此环形样式复刻了边缘光、圆周几何、分段展开和
 项目动画，暂不复制整屏倾斜；这不影响跟手、命中或分享。
 
+### 6.3 悬浮窗刷新率投票（1.10.9+）
+
+预览和菜单窗口默认跟随前台应用的显示模式：60 Hz 应用里拖拽以 60 Hz 渲染，120 Hz 应用里
+以 120 Hz 渲染，跟手手感随应用不同而漂移。`DisplayRefreshRate` 从三条通道请求面板最高
+支持刷新率：
+
+1. **窗口属性**：`Window`（`preferredRefreshRate` + `preferredDisplayModeId`）和
+   `LayoutParams`（`applyParams()`，用于不走 `Window` 的旧式预览、光效、环形与线性菜单）
+   在窗口加入前就带投票。
+2. **Surface 帧率投票**：`SurfaceControl.Transaction.setFrameRate(
+   FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, CHANGE_FRAME_RATE_ALWAYS)`。
+3. **API 34+ 的 `setDesiredRefreshRate`**：可见 Surface 能发出的最强应用侧投票，
+   以 milliHz 传值（120 Hz → `120000`）。
+
+此前版本读 `ViewRootImpl.mSurface` 再调 `Surface.setFrameRate()`，在 BLAST 设备上该字段在
+首次 relayout 后即被释放，日志全是 `Surface has already been released`，投票从未生效。
+1.10.9 改为反射 `ViewRootImpl.getSurfaceControl()` 取存活 SurfaceControl（`getViewRootImpl()`
+/`getSurfaceControl()` 为隐藏 API，注入代码运行在传送门进程，失败时静默回落到属性投票），
+并在 `ModernOverlayWindow.show()` 后按动画帧重试最多 8 次——SurfaceControl 要等窗口第一次
+relayout 才存在。投票对象是悬浮窗自己的 Surface，不会让窗口获得焦点或接管触摸，不违反
+`FLAG_NOT_TOUCHABLE` 约束。日志证据：`surface frame-rate vote applied rate=120`；
+HyperOS 的 `DisplayModeDirector` 聚合可见 Surface 的 appRequest 区间后决定是否抬升面板。
+
+1.10.11 实机结论：以上投票在 HyperOS 上**全部被 `MirimRefreshRatePolicy` 的 powerkeeper
+场景压过**（`[SceneFps] apply channel=powerkeeper fps=60`，拖拽期间面板始终跟随前台应用的
+限速，采样日志可证）。交互期面板 120/60 实际由 MIUI 的 `realControlRefreshRate` 状态机
+驱动：触摸触发 `UP policyStart`（120），约 0.8-7 s 后自动 `down refresh` 回 60；UP 窗口可被
+`[Extend] type=window_animation/transition/...` 续期（miui-services.jar 的
+`RefreshRatePolicy`，dex 已核对）。1.10.14 起采用两个对症手段：
+
+- **长按才抬升基础档**：`RootInputService` 按住 ≥450 ms（长按判定）才把
+  `settings secure miui_refresh_rate` 抬到 `user_refresh_rate`（基础模式族切 120），
+  UP 后 2 s 恢复原值；普通点按/浏览不抬升。进程启动时探测一次两个设置值。
+- **脉冲续期**：`DragShareController` 在会话期间每 500 ms 给预览窗口跑一次 80 ms、
+  1.000→1.004→1.000 的不可见缩放松（`ModernOverlayWindow.pulseBoost()`，旧式窗口走
+  `previewView` 同款动画），让 WM 持续报告窗口动画、MIUI 持续续期 UP 窗口，长拖拽
+  （含中途停顿）全程保持 120；会话结束即停，不干扰退场动画。
+
+surface 投票与窗口属性保留，作为其他 ROM 上的通用路径。
+
 ## 7. 设置页与运行时参数
 
 启动 Activity 已从旧的原生 `LinearLayout` 页面迁移为 Miuix Compose：
@@ -347,6 +488,13 @@ MCP 还会对截图背景做 `500 ms` 的缩放/平移动画，并在部分设�
 - `OverlayDropdownPreference` 提供颜色和拖拽样式（简洁、流光、环形、现代）选择；
 - `SwitchPreference` 提供文字分享、图片分享、拖拽时阻止背景滑动和四种样式共用的离开关闭开关；
   无障碍模式额外提供默认关闭的“横屏启用识别”。
+- 首页激活卡之后新增“常驻输入（实验）”开关（默认开）。它写入 `RootHelperPrefs`，开启时用
+  `startForegroundService` 拉起 `RootInputService`，关闭时 `stopService`；该开关只控制常驻
+  evdev helper，不改变内容获取方式。`get_settings` 的 Bundle 会附带 `root_helper_enabled`，
+  传送门侧 `RootEventClient` 观察设置 URI：关闭时立即 unbind 并回落到本地 evdev，开启时重新
+  bind，因此关闭后 `stopService` 能真正结束服务（没有残留绑定）。实机验证关闭时会出现
+  `root helper disabled; unbinding`、`helper stopped`、本地 evdev 重启和 FGS 通知取消；
+  重新打开后重新订阅并停掉本地 pipe。
 - 无障碍模式还提供“长按时间”（`250..1200 ms`）和“识别灵敏度”（`50..200%`）滑块；未调整
   长按时间时沿用系统 `ViewConfiguration` 的默认值，灵敏度按默认移动容差的倍率计算。
 - `SliderPreference` 提供边缘触发距离、滚动速度和公共图标不透明度。
@@ -754,12 +902,13 @@ APK 输出：
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-当前 75 个单元测试覆盖：当前版本注入握手与限定服务启动命令、传送门原浮窗在模块预览挂窗前的
-抑制、底部触发边界、左右滚动方向、边缘深度速度渐变、
+当前 82 个单元测试覆盖：当前版本注入握手与限定服务启动命令、传送门原浮窗在模块预览挂窗前的
+抑制（含延迟接管期间“已有输入帧才抑制原浮窗”的条件）、底部触发边界、左右滚动方向、边缘深度速度渐变、
 预览位置夹取、流光进度与项目缩放、近手方向映射、环形菜单左右触发/贴边半圆/自然项目顺序、
 新增外观设置和现代原生局部模糊参数的默认值/范围裁剪、原生 Window 局部模糊的圆角背景/降级判定、现代预览按文字与图片尺寸自适应并限制为屏宽三分之一、独立 Compose 悬浮窗的 ViewTree owner 传递、原始坐标与旋转映射、
 触摸设备发现、UUID URI 解析、设置默认值/范围/内容开关/目标规则以及本地图片时间文件名；
-新增测试还覆盖内容获取模式迁移、evdev DOWN/MOVE/UP/CANCEL、长按异步失效、节点文字/图片
+新增测试还覆盖内容获取模式迁移、evdev DOWN/MOVE/UP/CANCEL、只有坐标的“进行中触摸”接管、
+运行时目标按包名折叠、长按异步失效、节点文字/图片
 候选优先级、截图区域的扩边/缩放/夹取、日志等级/保存位置的 Provider Bundle 同步，以及背景锁开关的 Provider Bundle 同步、root 服务返回
 解析、当前 ROM DEX 的动态 Binder 事务解析与 `InputMonitor` 释放。传送门私有 Hook、WindowManager、root evdev、InputMonitor 权限、Miuix
 页面视觉效果和第三方应用分享仍必须实机验证。
@@ -808,5 +957,29 @@ DragShareProvider: open uid=...
 - 当前按第一个有效 MT slot 跟踪，不保证复杂多指切换体验。
 - 内置保存、外部分享和图片剪贴板都使用原尺寸 PNG；跨 UID 缓存的单文件上限为 `32 MiB`，
   超限时会失败，不会静默改成 JPEG 或降采样。
-- 传送门私有类和字段绑定 4.2.1，升级传送门后可能需要重新适配。
+- 传送门私有类和字段绑定 4.2.1；2026-11-01 用 5.1.5（50015）APK 的 DEX 逐项核对过
+  `TextContentExtensionService`、`startPickTextTask`/`startPickImageTask`/`cancelTask`、
+  `getBitmap`/`getFirstTouchPoint`/`getInjectorPoint`、`sContent`/`sIsTextMode`/
+  `sContentRect`/`sIsTaskFinished`、`BaseFloatView.addToWindow` 和
+  `TextContentExtensionService$1.onContentReceived(ClientCatcherResult)`；回调仍以
+  `String.valueOf(257/258)` 写入 `observe_control_event`，与模块的字符串比较一致。
+  静态符号一致不等于实机注入与拖拽已验收，升级传送门后仍需重新核对。
 - Provider 的能力 URI 优先兼容分享中继；完整 URI 在缓存清理前应被视为可读取凭证。
+
+## 13. 两侧展开菜单位置（1.8.0）
+
+- 设置项 `simple_menu_position` 新增值 `5`（`SIMPLE_MENU_POSITION_BOTH_SIDES`）。该模式只在
+  简洁/现代/流光样式下生效；传送门与环形样式继续走各自原有的位置逻辑。
+- 触发判定由 `GestureMath.nearestSideEdge(pointerX, screenWidth, triggerWidth)` 完成：只比较
+  指针到左右边缘的距离，超过 `max(edgeTriggerDp, MENU_TRIGGER_DP)` 时返回 `-1`，屏幕中央
+  因此不会展开菜单。
+- `DragShareController.updateBothSidesMenuSide()` 在每次指针移动时执行：指针在中央则收起
+  线性菜单；指针靠近某一侧且与当前 `simpleMenuPosition` 不同时，调用
+  `switchSimpleMenuSide()` 重建该侧竖排菜单。`refreshDisplayGeometry()` 在两侧展开模式下
+  不再把 `simpleMenuPosition` 重置为默认值，否则换边会被立即撤销。
+- 进入侧边带本身即视为激活：`hasQualifiedSimpleMenuActivation()` 对该模式返回 `true`，
+  避免换边后还要再移动一次 `SIMPLE_MENU_ACTIVATION_SLOP_DP`。
+- 菜单窗口仍然保持 `FLAG_NOT_TOUCHABLE`，只被动跟随指针；动作依旧在松手时由落点选中项
+  触发，不改 Root 输入权威、`cancelTask`/257 回放和 258 抑制。
+- 覆盖：`GestureMathTest#bothSidesMenuOnlyTriggersNearLeftOrRightEdge`、
+  `DragShareSettingsTest#bothSidesMenuPositionSurvivesRoundTripAndRejectsUnknownValues`。

@@ -43,9 +43,6 @@ public final class DragShareSettings {
     /** HyperOS View-blurred overlay with an adaptive square preview. */
     public static final int STYLE_MODERN = 3;
     public static final int DEFAULT_UI_STYLE = STYLE_MODERN;
-    /** @deprecated Kept as a source-compatibility alias for pre-1.4 callers. */
-    @Deprecated
-    public static final int STYLE_CARD = STYLE_PORTAL;
 
     public static final int MIN_EDGE_TRIGGER_DP = 24;
     public static final int DEFAULT_EDGE_TRIGGER_DP = 56;
@@ -60,6 +57,10 @@ public final class DragShareSettings {
     public static final int SIMPLE_MENU_POSITION_LEFT = 2;
     public static final int SIMPLE_MENU_POSITION_RIGHT = 3;
     public static final int SIMPLE_MENU_POSITION_NEAR_HAND = 4;
+    /** Shows the vertical menu on whichever side (left/right) the pointer approaches. */
+    public static final int SIMPLE_MENU_POSITION_BOTH_SIDES = 5;
+    /** OriginOS-like floating capsule pinned under the status bar. */
+    public static final int SIMPLE_MENU_POSITION_CAPSULE = 6;
     public static final int DEFAULT_SIMPLE_MENU_POSITION = SIMPLE_MENU_POSITION_BOTTOM;
 
     public static final int MIN_SIMPLE_MENU_OPACITY_PERCENT = 20;
@@ -86,7 +87,7 @@ public final class DragShareSettings {
     public static final int DEFAULT_MODERN_GLASS_OPACITY_PERCENT = 36;
     public static final int MAX_MODERN_GLASS_OPACITY_PERCENT = 90;
 
-    public static final boolean DEFAULT_BLOCK_BACKGROUND_SCROLL = false;
+    public static final boolean DEFAULT_BLOCK_BACKGROUND_SCROLL = true;
     public static final boolean DEFAULT_TEXT_SHARING_ENABLED = true;
     public static final boolean DEFAULT_IMAGE_SHARING_ENABLED = true;
     public static final boolean DEFAULT_PRELOAD_TEXT_SEGMENTER = true;
@@ -110,6 +111,7 @@ public final class DragShareSettings {
     public static final String TARGET_SAVE_LOCAL = "builtin:save_local";
     /** Stable key for the built-in text action. It is kept ahead of app targets. */
     public static final String TARGET_TEXT_SEGMENTATION = "builtin:text_segmentation";
+    public static final String TARGET_SYSTEM_SHARE = "builtin:system_share";
 
     static final String METHOD_GET_SETTINGS = "get_settings";
 
@@ -120,6 +122,8 @@ public final class DragShareSettings {
     private static final String KEY_EDGE_TRIGGER_DP = "edge_trigger_dp";
     private static final String KEY_SCROLL_SPEED = "scroll_speed_dp_per_second";
     private static final String KEY_BLOCK_BACKGROUND_SCROLL = "block_background_scroll";
+    private static final String KEY_BLOCK_BACKGROUND_MIGRATED =
+            "block_background_default_migrated";
     private static final String KEY_TEXT_SHARING_ENABLED = "text_sharing_enabled";
     private static final String KEY_IMAGE_SHARING_ENABLED = "image_sharing_enabled";
     private static final String KEY_TEXT_COPY_ENABLED = "text_copy_enabled";
@@ -718,6 +722,7 @@ public final class DragShareSettings {
                 preferences.getStringSet(KEY_HIDDEN_TARGETS, Collections.emptySet()),
                 preferences.getBoolean(KEY_TEXT_COPY_ENABLED, true),
                 preferences.getBoolean(KEY_IMAGE_COPY_ENABLED, true));
+        boolean blockBackgroundScroll = migrateBlockBackgroundScroll(preferences);
         return new DragShareSettings(
                 preferences.getInt(KEY_COLOR_MODE, COLOR_LIGHT),
                 preferences.getInt(KEY_UI_STYLE, DEFAULT_UI_STYLE),
@@ -725,9 +730,7 @@ public final class DragShareSettings {
                 preferences.getInt(
                         KEY_SCROLL_SPEED,
                         DEFAULT_SCROLL_SPEED_DP_PER_SECOND),
-                preferences.getBoolean(
-                        KEY_BLOCK_BACKGROUND_SCROLL,
-                        DEFAULT_BLOCK_BACKGROUND_SCROLL),
+                blockBackgroundScroll,
                 preferences.getBoolean(
                         KEY_TEXT_SHARING_ENABLED,
                         DEFAULT_TEXT_SHARING_ENABLED),
@@ -1019,8 +1022,26 @@ public final class DragShareSettings {
         return Uri.parse(SETTINGS_URI_VALUE);
     }
 
-    private static Set<String> migrateLegacyCopyTargetVisibility(
-            Set<String> hiddenTargetKeys,
+    /**
+     * The old default was "off", and the settings screen persists every key whenever any
+     * unrelated preference changes, so a stored false cannot be distinguished from the old
+     * default. Flip it on exactly once; afterwards the switch is respected normally.
+     */
+    private static boolean migrateBlockBackgroundScroll(SharedPreferences preferences) {
+        boolean enabled = preferences.getBoolean(
+                KEY_BLOCK_BACKGROUND_SCROLL,
+                DEFAULT_BLOCK_BACKGROUND_SCROLL);
+        if (!preferences.getBoolean(KEY_BLOCK_BACKGROUND_MIGRATED, false)) {
+            enabled = true;
+            preferences.edit()
+                    .putBoolean(KEY_BLOCK_BACKGROUND_SCROLL, true)
+                    .putBoolean(KEY_BLOCK_BACKGROUND_MIGRATED, true)
+                    .apply();
+        }
+        return enabled;
+    }
+
+    private static Set<String> migrateLegacyCopyTargetVisibility(Set<String> hiddenTargetKeys,
             boolean textCopyEnabled,
             boolean imageCopyEnabled) {
         LinkedHashSet<String> hidden = new LinkedHashSet<>(normalizeHiddenTargetKeys(
@@ -1103,7 +1124,7 @@ public final class DragShareSettings {
 
     private static int normalizeSimpleMenuPosition(int position) {
         return position >= SIMPLE_MENU_POSITION_TOP
-                && position <= SIMPLE_MENU_POSITION_NEAR_HAND
+                && position <= SIMPLE_MENU_POSITION_CAPSULE
                 ? position
                 : DEFAULT_SIMPLE_MENU_POSITION;
     }

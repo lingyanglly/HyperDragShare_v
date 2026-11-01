@@ -21,7 +21,11 @@ public final class PortalHostFloatWindowSuppressionTest {
         assertFalse(controller.shouldSuppressPortalHostFloatWindow());
 
         controller.reservePortalHostFloatWindowSuppression();
+        // The reservation stays inert until an input frame proves the stream is live:
+        // suppressing Taplus' float window earlier starves its own drag feed.
+        assertFalse(controller.shouldSuppressPortalHostFloatWindow());
 
+        controller.noteRootPointer();
         assertTrue(controller.shouldSuppressPortalHostFloatWindow());
 
         controller.destroy();

@@ -12,6 +12,29 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class ImageStagingClient {
+    /**
+     * Segments text in the module process, where cppjieba and its assets live. The portal
+     * process has no native library, so the segmentation overlay must use this RPC.
+     */
+    static int[] segmentText(Context context, String text) {
+        if (context == null || text == null || text.isEmpty()) {
+            return null;
+        }
+        Bundle extras = new Bundle();
+        extras.putString(EXTRA_SEGMENT_TEXT, text);
+        try {
+            Bundle result = context.getContentResolver().call(
+                    BASE_URI,
+                    METHOD_SEGMENT_TEXT,
+                    null,
+                    extras);
+            return result == null ? null : result.getIntArray(RESULT_SEGMENT);
+        } catch (Throwable error) {
+            DragShareLog.w("DragShare/Jieba", "segment_text RPC failed", error);
+            return null;
+        }
+    }
+
     interface Callback {
         void onStaged(Uri uri);
 
@@ -23,6 +46,9 @@ final class ImageStagingClient {
     static final String METHOD_STAGE = "stage_image";
     static final String METHOD_GRANT = "grant_image";
     static final String METHOD_REVOKE = "revoke_image";
+    static final String METHOD_SEGMENT_TEXT = "segment_text";
+    static final String EXTRA_SEGMENT_TEXT = "segment_text_value";
+    static final String RESULT_SEGMENT = "segment";
     /** Legacy byte-array input accepted by the Provider during process upgrades. */
     static final String EXTRA_BYTES = "bytes";
     static final String EXTRA_STREAM = "stream";

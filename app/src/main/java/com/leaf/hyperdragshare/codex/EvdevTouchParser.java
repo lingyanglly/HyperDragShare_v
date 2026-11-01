@@ -27,11 +27,13 @@ final class EvdevTouchParser {
 
     private int currentSlot;
     private int primarySlot = -1;
+    private int adoptedSlot = -1;
     private boolean gestureActive;
     private boolean buttonTouchSeen;
     private boolean buttonTouchDown;
     private boolean buttonDownEdge;
     private boolean sawTrackingStart;
+    private boolean adoptsInFlightStroke = true;
     private boolean primaryLifted;
     private boolean multiTouchDetected;
     private boolean frameChanged;
@@ -78,6 +80,7 @@ final class EvdevTouchParser {
             if (value < 0) {
                 if (currentSlot == primarySlot) {
                     primaryLifted = true;
+                    adoptedSlot = -1;
                 }
                 trackingId[currentSlot] = -1;
             } else {
@@ -87,7 +90,11 @@ final class EvdevTouchParser {
                 trackingId[currentSlot] = value;
                 slotX[currentSlot] = Float.NaN;
                 slotY[currentSlot] = Float.NaN;
+                if (currentSlot == primarySlot) {
+                    adoptedSlot = -1;
+                }
                 sawTrackingStart = true;
+                adoptsInFlightStroke = false;
             }
             frameChanged = true;
             return;
@@ -116,15 +123,26 @@ final class EvdevTouchParser {
         }
 
         int candidate = firstTrackedSlotWithCoordinates();
-        if (candidate < 0 && buttonTouchSeen && buttonTouchDown) {
+        if (candidate < 0 && ((buttonTouchSeen && buttonTouchDown) || adoptsInFlightStroke)) {
+            // The stream can start in the middle of a stroke. Type-B drivers only report
+            // ABS_MT_TRACKING_ID on the down edge, so a reader that attached afterwards
+            // sees position-only frames and would otherwise drop the whole gesture.
             candidate = firstSlotWithCoordinates();
         }
 
         if (!gestureActive) {
             if (trackedCount > 1) {
                 ignoreUntilAllPointersUp = true;
-            } else if (candidate >= 0 && (sawTrackingStart || buttonDownEdge)) {
+            } else if (candidate >= 0 && (sawTrackingStart || buttonDownEdge
+                    || adoptsInFlightStroke)) {
+                // The evdev stream can start in the middle of a real stroke (portal
+                // restarted while the finger was already down). Adopt that stroke with a
+                // synthetic DOWN so the preview keeps following instead of freezing.
+                adoptsInFlightStroke = false;
                 primarySlot = candidate;
+                if (trackingId[candidate] < 0) {
+                    adoptedSlot = candidate;
+                }
                 gestureActive = true;
                 setLast(candidate);
                 listener.onFrame(MotionEvent.ACTION_DOWN, lastX, lastY);
@@ -139,7 +157,8 @@ final class EvdevTouchParser {
             return;
         }
 
-        boolean primaryTracked = primarySlot >= 0 && trackingId[primarySlot] >= 0;
+        boolean primaryTracked = primarySlot >= 0
+                && (trackingId[primarySlot] >= 0 || adoptedSlot == primarySlot);
         boolean buttonReleased = buttonTouchSeen && !buttonTouchDown;
         if (!primaryTracked || primaryLifted || buttonReleased) {
             emitUp();
@@ -235,7 +254,10 @@ final class EvdevTouchParser {
     private void resetGesture() {
         gestureActive = false;
         primarySlot = -1;
+        adoptedSlot = -1;
         primaryLifted = false;
+        sawTrackingStart = false;
+        adoptsInFlightStroke = true;
         lastX = Float.NaN;
         lastY = Float.NaN;
     }

@@ -42,9 +42,9 @@ public class BoomActionHandler implements CustomScrollView.OnScrollListener {
     public BoomActionHandler(BoomChipPage boomPage, boolean enableFakeSelectBar) {
         mBoomPage = boomPage;
         mEnableFakeSelectBar = enableFakeSelectBar;
-        mToast = Toast.makeText(boomPage.mActivity, "", Toast.LENGTH_SHORT);
+        mToast = Toast.makeText(boomPage.mContext, "", Toast.LENGTH_SHORT);
 
-        final Resources res = boomPage.mActivity.getResources();
+        final Resources res = boomPage.mContext.getResources();
         mRowMoveUpOffset = res.getDimensionPixelOffset(R.dimen.chip_row_move_up_offset);
         mRowMoveDownOffset = res.getDimensionPixelOffset(R.dimen.chip_row_move_down_offset);
         if (mEnableFakeSelectBar) {
@@ -197,15 +197,15 @@ public class BoomActionHandler implements CustomScrollView.OnScrollListener {
     }
 
     private void copy(String text) {
-        mToast.setText(mBoomPage.mActivity.getResources().getString(R.string.copy_tips));
+        mToast.setText(mBoomPage.mContext.getResources().getString(R.string.copy_tips));
         mToast.show();
-        ClipboardManager clipboard = (ClipboardManager) mBoomPage.mActivity.getSystemService(Context.CLIPBOARD_SERVICE);
+        ClipboardManager clipboard = (ClipboardManager) mBoomPage.mContext.getSystemService(Context.CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText(null, text));
     }
 
     public void search(String text, int type) {
-        if (mBoomPage.mActivity instanceof TextSegmentationActivity) {
-            ((TextSegmentationActivity) mBoomPage.mActivity).openSearch(text, type);
+        if (mBoomPage.mHost != null) {
+            mBoomPage.mHost.openSearch(text, type);
         }
     }
 
@@ -215,8 +215,8 @@ public class BoomActionHandler implements CustomScrollView.OnScrollListener {
         send.setType("text/plain");
         send.putExtra(Intent.EXTRA_TEXT, shareText);
         Intent i = Intent.createChooser(send, null);
-        i.setFlags(Intent.FLAG_ACTIVITY_NO_HISTORY);
-        mBoomPage.mActivity.startActivity(i);
+        i.setFlags(Intent.FLAG_ACTIVITY_NO_HISTORY | Intent.FLAG_ACTIVITY_NEW_TASK);
+        mBoomPage.mContext.startActivity(i);
     }
 
     private void initViews(View contentView) {

@@ -8,23 +8,55 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.concurrent.TimeUnit;
 
-/** In-memory Root screenshot fallback for Android 9 and 10. */
+/** In-memory root screenshot used as the internal fallback when direct capture fails. */
 final class RootScreenshotter {
     private static final long COMMAND_TIMEOUT_SECONDS = 4L;
 
     Bitmap capture() throws IOException {
         java.lang.Process process = null;
+        Thread reader = null;
         try {
             process = new ProcessBuilder("su", "-c", "/system/bin/screencap -p").start();
-            byte[] bytes;
-            try (InputStream input = process.getInputStream()) {
-                bytes = readAll(input);
+            final java.lang.Process currentProcess = process;
+            // The PNG payload is far larger than the pipe buffer, so the stream must be
+            // drained while the command runs. Reading on a dedicated thread keeps a hung
+            // su (authorization dialog etc.) from blocking the caller forever: the timeout
+            // below kills the process and the stream close unblocks the reader.
+            final byte[][] result = new byte[1][];
+            final Throwable[] readError = new Throwable[1];
+            reader = new Thread(() -> {
+                try (InputStream input = currentProcess.getInputStream()) {
+                    result[0] = readAll(input);
+                } catch (Throwable error) {
+                    readError[0] = error;
+                }
+            }, "drag-share-screencap-reader");
+            reader.setDaemon(true);
+            reader.start();
+
+            boolean finished;
+            try {
+                finished = currentProcess.waitFor(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                currentProcess.destroyForcibly();
+                throw new IOException("Root screencap interrupted", interrupted);
             }
-            if (!process.waitFor(COMMAND_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
+            if (!finished) {
+                currentProcess.destroyForcibly();
                 throw new IOException("Root screencap timed out");
             }
-            if (process.exitValue() != 0 || bytes.length == 0) {
+            try {
+                reader.join(2_000L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Root screencap interrupted", interrupted);
+            }
+            if (readError[0] != null) {
+                throw new IOException("Root screencap read failed", readError[0]);
+            }
+            byte[] bytes = result[0];
+            if (currentProcess.exitValue() != 0 || bytes == null || bytes.length == 0) {
                 throw new IOException("Root screencap failed");
             }
             Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
@@ -32,9 +64,6 @@ final class RootScreenshotter {
                 throw new IOException("Root screencap returned invalid PNG");
             }
             return bitmap;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Root screencap interrupted", interrupted);
         } finally {
             if (process != null) {
                 try {

@@ -2,6 +2,7 @@ package com.leaf.hyperdragshare.codex;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -48,7 +49,12 @@ public final class ShareImageProvider extends ContentProvider {
         }
         if (DragShareSettings.METHOD_GET_SETTINGS.equals(method)) {
             enforcePortalCaller();
-            return DragShareSettings.readLocal(contextOrThrow()).toBundle();
+            Context context = contextOrThrow();
+            Bundle result = DragShareSettings.readLocal(context).toBundle();
+            result.putBoolean(
+                    RootHelperPrefs.BUNDLE_KEY,
+                    RootHelperPrefs.isEnabled(context));
+            return result;
         }
         if (ImageStagingClient.METHOD_GRANT.equals(method)) {
             enforcePortalCaller();
@@ -57,6 +63,23 @@ public final class ShareImageProvider extends ContentProvider {
         if (ImageStagingClient.METHOD_REVOKE.equals(method)) {
             enforcePortalCaller();
             return revokeImage(extras);
+        }
+        if (ImageStagingClient.METHOD_SEGMENT_TEXT.equals(method)) {
+            enforcePortalCaller();
+            String text = extras == null
+                    ? null
+                    : extras.getString(ImageStagingClient.EXTRA_SEGMENT_TEXT);
+            int[] segment = null;
+            if (text != null && !text.isEmpty()) {
+                try {
+                    segment = TextSegmenter.get(contextOrThrow()).segment(text);
+                } catch (Throwable error) {
+                    DragShareLog.w(TAG, "segment_text failed", error);
+                }
+            }
+            Bundle result = new Bundle();
+            result.putIntArray(ImageStagingClient.RESULT_SEGMENT, segment);
+            return result;
         }
         if (!ImageStagingClient.METHOD_STAGE.equals(method)) {
             return super.call(method, arg, extras);

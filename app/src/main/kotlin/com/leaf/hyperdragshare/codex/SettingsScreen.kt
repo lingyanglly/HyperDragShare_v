@@ -322,6 +322,36 @@ private fun MainPage(
                     },
                 )
             }
+            item(key = "root-helper") {
+                Card(modifier = Modifier.padding(horizontal = 12.dp).padding(top = 12.dp)) {
+                    var rootHelperOn by remember {
+                        mutableStateOf(RootHelperPrefs.isEnabled(context))
+                    }
+                    SwitchPreference(
+                        title = "常驻输入（实验）",
+                        summary = "保持触摸读取常驻，传送门启动后的第一个拖拽即可跟手",
+                        checked = rootHelperOn,
+                        onCheckedChange = { checked ->
+                            rootHelperOn = checked
+                            RootHelperPrefs.setEnabled(context, checked)
+                            val helperIntent = Intent(context, RootInputService::class.java)
+                            if (checked) {
+                                try {
+                                    context.startForegroundService(helperIntent)
+                                } catch (error: Throwable) {
+                                    DragShareLog.w(
+                                        "DragShare/Settings",
+                                        "root helper start failed",
+                                        error,
+                                    )
+                                }
+                            } else {
+                                context.stopService(helperIntent)
+                            }
+                        },
+                    )
+                }
+            }
             item(key = "content-title") {
                 SmallTitle(text = "分享内容")
             }
@@ -512,14 +542,14 @@ private fun MainPage(
                     Card(modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
                         OverlayDropdownPreference(
                             title = "菜单位置",
-                            summary = "选择分享菜单出现的屏幕边缘",
-                            items = listOf("上", "下", "左", "右", "近手方向"),
-                            selectedIndex = settings.simpleMenuPosition.coerceIn(0, 4),
+                            summary = "选择分享菜单出现的位置；顶部胶囊贴近状态栏，两侧展开只在左右边缘出现",
+                            items = listOf("上", "下", "左", "右", "近手方向", "两侧展开", "顶部胶囊"),
+                            selectedIndex = settings.simpleMenuPosition.coerceIn(0, 6),
                             onSelectedIndexChange = { selected ->
                                 persist(
                                     copySettings(
                                         settings,
-                                        simpleMenuPosition = selected.coerceIn(0, 4),
+                                        simpleMenuPosition = selected.coerceIn(0, 6),
                                     ),
                                 )
                             },
@@ -980,14 +1010,14 @@ private fun ActivationStatusCard(
     val summary = when (state) {
         ActivationUiState.Checking -> "正在检查运行环境"
         ActivationUiState.NoRoot -> "Root 输入通道当前不可用"
-        ActivationUiState.NotInjected -> "当前版本尚未在传送门进程中加载\n如果传送门未启动，该提示为正常现象"
-        ActivationUiState.PortalRootUnavailable -> "传送门进程未通过 Root 权限检测\n如果传送门未启动，该提示为正常现象"
+        ActivationUiState.NotInjected -> "当前版本尚未在传送门进程中加载\n如果传送门正在运行旧版本，重启设备后即可生效"
+        ActivationUiState.PortalRootUnavailable -> "传送门进程未通过 Root 权限检测\n如果传送门正在运行旧版本，重启设备后重试"
         ActivationUiState.AccessibilityDisabled -> "请在系统设置中手动开启“HyperDragShare”服务"
         ActivationUiState.AccessibilityConnecting -> "正在等待无障碍服务和 Root 输入就绪"
         ActivationUiState.Active -> if (contentCaptureMode == DragShareSettings.CONTENT_CAPTURE_ACCESSIBILITY) {
             "无障碍服务与 Root 输入均已就绪"
         } else {
-            "传送门 4.2.1 已加载当前模块"
+            "传送门已加载当前模块"
         }
     }
     val activationMethod = when (state) {

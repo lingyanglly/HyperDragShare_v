@@ -115,6 +115,18 @@ public final class GestureMathTest {
     }
 
     @Test
+    public void bothSidesMenuOnlyTriggersNearLeftOrRightEdge() {
+        assertEquals(
+                DragShareSettings.SIMPLE_MENU_POSITION_LEFT,
+                GestureMath.nearestSideEdge(10f, 1000, 72));
+        assertEquals(
+                DragShareSettings.SIMPLE_MENU_POSITION_RIGHT,
+                GestureMath.nearestSideEdge(990f, 1000, 72));
+        assertEquals(-1, GestureMath.nearestSideEdge(500f, 1000, 72));
+        assertEquals(-1, GestureMath.nearestSideEdge(500f, 1000, 0));
+    }
+
+    @Test
     public void rawTouchRangeAccountsForRotation() {
         assertArrayEquals(
                 new float[]{2655f, 0f},

@@ -28,6 +28,12 @@ final class RootTouchSource {
             "ABS_MT_POSITION_X\\s*:.*?max\\s+(\\d+)");
     private static final Pattern MAX_Y = Pattern.compile(
             "ABS_MT_POSITION_Y\\s*:.*?max\\s+(\\d+)");
+    /**
+     * The root {@code su cat} pipe can be torn down by the ROM's process management while
+     * the device idles. Restart discovery after a short pause so the next gesture does not
+     * have to wait for a full helper rebind cycle.
+     */
+    private static final long RESTART_DELAY_MS = 2_000L;
 
     private final Context context;
     private final Listener listener;
@@ -91,6 +97,30 @@ final class RootTouchSource {
     }
 
     private void runLoop() {
+        while (running) {
+            boolean restart = runDiscoveryAndRead();
+            if (!running || !restart) {
+                return;
+            }
+            log("input stream ended unexpectedly; restarting discovery in "
+                    + RESTART_DELAY_MS + "ms");
+            try {
+                Thread.sleep(RESTART_DELAY_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
+     * One full attempt: discover the device, open the pipe and read until it ends.
+     *
+     * @return {@code true} when the pipe died on its own and the source should retry;
+     *         discovery failures and explicit stops return {@code false}.
+     */
+    private boolean runDiscoveryAndRead() {
+        InputStream stream = null;
         try {
             DragShareLog.d(TAG, "starting touchscreen discovery");
             String devicePath = findTouchDevice();
@@ -101,7 +131,7 @@ final class RootTouchSource {
                         "no touchscreen candidate",
                         discoveredDevices,
                         null);
-                return;
+                return false;
             }
             int[] ranges = readCoordinateRanges(devicePath);
             rawMaxX = ranges[0];
@@ -113,10 +143,10 @@ final class RootTouchSource {
                         "invalid coordinate range for " + devicePath,
                         discoveredDevices,
                         null);
-                return;
+                return false;
             }
 
-            InputStream stream = openDevice(devicePath);
+            stream = openDevice(devicePath);
             inputStream = stream;
             ready = true;
             DisplayMetrics metrics = currentDisplayMetrics();
@@ -126,6 +156,7 @@ final class RootTouchSource {
                     + " eventSize=" + inputEventSize());
             DragShareLog.d(TAG, "starting evdev read loop path=" + devicePath);
             readEvents(stream);
+            return running;
         } catch (Throwable error) {
             if (running) {
                 log("input loop failed", error);
@@ -135,6 +166,9 @@ final class RootTouchSource {
                         discoveredDevices,
                         null);
             }
+            // Only retry when the pipe had already been opened and then died; a failing
+            // discovery/open (e.g. revoked root) must not turn into an endless su loop.
+            return running && stream != null;
         } finally {
             if (running && !firstEventLogged) {
                 DragShareLog.d(TAG, "input stream ended before a decoded pointer action");
@@ -146,14 +180,15 @@ final class RootTouchSource {
             }
             parser.cancel();
             ready = false;
-            closeQuietly(inputStream);
-            inputStream = null;
+            closeQuietly(stream);
+            if (inputStream == stream) {
+                inputStream = null;
+            }
             java.lang.Process currentProcess = process;
             process = null;
             if (currentProcess != null) {
                 currentProcess.destroy();
             }
-            running = false;
         }
     }
 
@@ -306,9 +341,11 @@ final class RootTouchSource {
             return;
         }
         float[] screenPoint = toScreenCoordinates(rawX, rawY);
-        DragShareLog.d(TAG, "decoded " + MotionEvent.actionToString(action)
-                + " raw=" + Math.round(rawX) + ',' + Math.round(rawY)
-                + " mapped=" + Math.round(screenPoint[0]) + ',' + Math.round(screenPoint[1]));
+        if (DragShareLog.isDebugEnabled()) {
+            DragShareLog.d(TAG, "decoded " + MotionEvent.actionToString(action)
+                    + " raw=" + Math.round(rawX) + ',' + Math.round(rawY)
+                    + " mapped=" + Math.round(screenPoint[0]) + ',' + Math.round(screenPoint[1]));
+        }
         emit(action, screenPoint[0], screenPoint[1]);
     }
 

@@ -2,11 +2,14 @@
 
 HyperDragShare 是一个 Android LSPosed 模块，为 HyperOS 传送门的文字和图片长按提供同一手势内的跟手预览与分享菜单。
 
+> **修改说明**：本仓库是 [`Leaf-lsgtky/HyperDragShare`](https://github.com/Leaf-lsgtky/HyperDragShare) 的修改版本（修改日期：2026-11，当前版本 `1.11.0`）。新增与修改内容见 [`docs/ROOT_HELPER_NEXT.md`](docs/ROOT_HELPER_NEXT.md) 中 1.8.0 起的记录；许可证保持 `GPL-3.0-only` 不变，见 [LICENSE](LICENSE)。
+
 ## 功能
 
 - 使用 Root evdev 输入，在传送门识别长按后继续跟随当前手指。
 - 支持文字分享、图片分享、保存图片到本地和文本分词。
 - 提供简洁、流光和环形三种可配置的分享菜单，以及深浅色外观、目标排序和隐藏设置。
+- 简洁/现代/流光样式新增「两侧展开」菜单位置：只在指针靠近左右边缘时展开对应一侧的竖排菜单，指针回到屏幕中央后收起，同一手势再次靠近任一侧仍可展开。
 - 可选无障碍内容获取模式；该模式仍需要 Root 输入，且不会扩大 LSPosed 作用域。
 - 支持可关闭的系统日志或 root 保护的诊断文件导出；调试模式会记录输入节点与运行环境信息。
 
@@ -15,11 +18,15 @@ HyperDragShare 是一个 Android LSPosed 模块，为 HyperOS 传送门的文字
 - Android 13 或更高版本。
 - 已安装并启用 LSPosed；模块作用域仅选择 `com.miui.contentextension`。
 - Root 权限用于读取 Linux evdev，从而可靠地跟随同一次拖拽。
-- 已验证传送门版本：`4.2.1`。
+- 已验证传送门版本：`4.2.1`、`5.1.5`（`50015`，Android 17 / HyperOS 4.0）。
+  5.1.5 的 `TextContentExtensionService`、`startPickTextTask`/`startPickImageTask`、
+  `cancelTask`、`getBitmap`、`getFirstTouchPoint`、`getInjectorPoint`、`sContent`、
+  `sIsTextMode`、`BaseFloatView.addToWindow` 以及回调里的
+  `observe_control_event`（`257`/`258` 字符串）均与当前 Hook 契约一致。
 
 ## 安装
 
-1. 从 [Releases](https://github.com/Leaf-lsgtky/HyperDragShare/releases) 下载 APK 并安装。
+1. 从 [Releases](https://github.com/lingyanglly/HyperDragShare_v/releases) 下载 APK 并安装。
 2. 在 LSPosed 中启用 HyperDragShare，作用域只勾选传送门。
 3. 重新启动传送门作用域进程后，打开 HyperDragShare 完成设置。
 

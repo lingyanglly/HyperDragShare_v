@@ -8,10 +8,6 @@ final class ShareUriToken {
 
     private ShareUriToken() {}
 
-    static String fileName(String token) {
-        return fileName(token, PNG_SUFFIX);
-    }
-
     static String fileName(String token, String suffix) {
         if (parse(token) == null) {
             throw new IllegalArgumentException("Invalid share token");

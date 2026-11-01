@@ -1,6 +1,6 @@
 package com.leaf.hyperdragshare.codex;
 
-import android.app.Activity;
+import android.content.Context;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.util.TypedValue;
@@ -15,12 +15,19 @@ import java.io.Serializable;
 import java.util.TreeSet;
 
 public class BoomChipPage {
+    /** The host decides how the page disappears and where search requests are routed. */
+    public interface Host {
+        void requestDismiss();
+
+        void openSearch(String text, int type);
+    }
     
     private final static String TAG = "BoomChipPage";
     private final static boolean DBG = TextSegmentationActivity.DBG;
 
     final BoomWordsLayout mLayout;
-    final Activity mActivity;
+    final Context mContext;
+    final Host mHost;
     final View mBoomTable;
     final View mMask;
     final CustomScrollView mScroller;
@@ -102,8 +109,9 @@ public class BoomChipPage {
         }
     };
 
-    public BoomChipPage(Activity activity, View contentView, boolean enableLegacyMask) {
-        mActivity = activity;
+    public BoomChipPage(Context context, Host host, View contentView, boolean enableLegacyMask) {
+        mContext = context;
+        mHost = host;
         mEnableLegacyMask = enableLegacyMask;
         mBoomPage = contentView;
         mBoomTable = contentView.findViewById(R.id.boom_table);
@@ -116,22 +124,20 @@ public class BoomChipPage {
         mScrollerBaseInset = (int) TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP,
                 28,
-                mActivity.getResources().getDisplayMetrics()
+                mContext.getResources().getDisplayMetrics()
         );
         if (!mEnableLegacyMask) {
             mMask.setVisibility(View.GONE);
             removeLegacyChromeSpacing();
         }
-        mLayout = new BoomWordsLayout(mActivity);
+        mLayout = new BoomWordsLayout(mContext);
         mBoomConent.setBoomPage(this);
         mDismissClickListener = new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 if (!handleClick()) {
-                if (mActivity instanceof TextSegmentationActivity) {
-                    ((TextSegmentationActivity) mActivity).requestAnimatedDismissFromLegacy();
-                    } else {
-                        mActivity.finish();
+                    if (mHost != null) {
+                        mHost.requestDismiss();
                     }
                 }
             }
@@ -164,7 +170,7 @@ public class BoomChipPage {
 
     private void removeLegacyChromeSpacing() {
         int selectBarHeadroom = Math.abs(
-                mActivity.getResources().getDimensionPixelOffset(R.dimen.chip_row_move_up_offset)
+                mContext.getResources().getDimensionPixelOffset(R.dimen.chip_row_move_up_offset)
         );
         ViewGroup.MarginLayoutParams scrollerParams = (ViewGroup.MarginLayoutParams) mScroller.getLayoutParams();
         scrollerParams.topMargin = 0;
@@ -450,24 +456,24 @@ public class BoomChipPage {
             final int start = mLayout.getRowStart(i);
             final int count = mLayout.getColumnCount(i);
             if (mLayout.isGapRow(i)) {
-                final int rowHeight = mActivity.getResources().getDimensionPixelOffset(R.dimen.chip_row_height);
+                final int rowHeight = mContext.getResources().getDimensionPixelOffset(R.dimen.chip_row_height);
                 final int gapHeight = Math.round(
-                        rowHeight * BigBangSettings.get(mActivity).getGapRowHeightPercent() / 100f
+                        rowHeight * BigBangSettings.get(mContext).getGapRowHeightPercent() / 100f
                 );
-                View spacer = new View(mActivity);
+                View spacer = new View(mContext);
                 spacer.setLayoutParams(new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         gapHeight));
                 mBoomConent.addView(spacer);
                 continue;
             }
-            LinearLayout row = new LinearLayout(mActivity);
+            LinearLayout row = new LinearLayout(mContext);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setLayoutParams(new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
             for(int j = 0; j < count; ++j) {
                 boolean isPunc = mLayout.isPunc(start + j);
-                View chipView = mActivity.getLayoutInflater().inflate(
+                View chipView = android.view.LayoutInflater.from(mContext).inflate(
                         isPunc ? R.layout.boom_punc_layout : R.layout.boom_chip_layout, null);
                 BoomChip chip = new BoomChip(start + j, chipView);
                 chipView.setTag(chip);
@@ -606,15 +612,15 @@ public class BoomChipPage {
 
     private String getHintTitle(String direction) {
         return "before".equals(direction)
-                ? mActivity.getString(R.string.bigbang_pull_previous)
-                : mActivity.getString(R.string.bigbang_pull_next);
+                ? mContext.getString(R.string.bigbang_pull_previous)
+                : mContext.getString(R.string.bigbang_pull_next);
     }
 
     private float getTriggerDistance() {
         return TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP,
                 88f,
-                mActivity.getResources().getDisplayMetrics()
+                mContext.getResources().getDisplayMetrics()
         );
     }
 

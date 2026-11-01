@@ -24,6 +24,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -83,6 +88,7 @@ import kotlin.math.max
 private const val MODERN_MENU_ICON_SIZE_DP = 44
 private const val MODERN_MENU_ITEM_WIDTH_DP = 76
 private const val MODERN_MENU_ITEM_HEIGHT_DP = 84
+private const val MODERN_DOCK_ITEM_SIZE_DP = 64
 private const val MODERN_MENU_ITEM_STAGGER_MS = 38L
 private const val MODERN_CARD_CORNER_RADIUS_DP = 16f
 private const val MODERN_OVERLAY_ENTER_DURATION_MS = 220L
@@ -291,16 +297,22 @@ internal class ModernMenuOverlayView(
 ) : ModernOverlayComposeView(context) {
     private val itemBounds = LinkedHashMap<ShareTarget, androidx.compose.ui.geometry.Rect>()
     private var selectedTargetState by mutableStateOf<ShareTarget?>(null)
-    private var scrollState: ScrollState? = null
+    private var listState: androidx.compose.foundation.lazy.LazyListState? = null
+    private var scrollScope: kotlinx.coroutines.CoroutineScope? = null
 
     init {
         setOverlayContent {
             ModernOverlayTheme(settings) {
-                val state = rememberScrollState()
-                SideEffect { scrollState = state }
+                val state = androidx.compose.foundation.lazy.rememberLazyListState()
+                val scope = androidx.compose.runtime.rememberCoroutineScope()
+                SideEffect {
+                    listState = state
+                    scrollScope = scope
+                }
                 DisposableEffect(Unit) {
                     onDispose {
-                        scrollState = null
+                        listState = null
+                        scrollScope = null
                         itemBounds.clear()
                     }
                 }
@@ -311,25 +323,18 @@ internal class ModernMenuOverlayView(
                     modifier = Modifier.fillMaxSize(),
                 ) {
                     if (targets.isEmpty()) {
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            androidx.compose.material3.Text(
-                                text = "没有可用的分享应用",
-                                color = MiuixTheme.colorScheme.onSurfaceContainer,
-                                fontSize = 13.sp,
-                            )
-                        }
+                        // Intentionally blank: the controller no longer opens an empty
+                        // menu, and a placeholder here used to leak onto the host app.
+                        Box(modifier = Modifier.fillMaxSize())
                     } else if (vertical) {
-                        Column(
+                        LazyColumn(
+                            state = state,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .verticalScroll(state)
                                 .padding(vertical = 6.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
-                            targets.forEachIndexed { index, target ->
+                            itemsIndexed(targets) { index, target ->
                                 ModernShareTarget(
                                     target = target,
                                     icon = icons[target],
@@ -337,9 +342,10 @@ internal class ModernMenuOverlayView(
                                     visible = contentVisible,
                                     index = index,
                                     iconOpacity = settings.iconOpacityPercent / 100f,
+                                    showLabel = false,
                                     modifier = Modifier.size(
-                                        MODERN_MENU_ITEM_WIDTH_DP.dp,
-                                        MODERN_MENU_ITEM_HEIGHT_DP.dp,
+                                        MODERN_DOCK_ITEM_SIZE_DP.dp,
+                                        MODERN_DOCK_ITEM_SIZE_DP.dp,
                                     ),
                                     onBoundsChanged = { itemBounds[target] = it },
                                     onDisposed = { itemBounds.remove(target) },
@@ -347,14 +353,14 @@ internal class ModernMenuOverlayView(
                             }
                         }
                     } else {
-                        Row(
+                        LazyRow(
+                            state = state,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .horizontalScroll(state)
                                 .padding(horizontal = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            targets.forEachIndexed { index, target ->
+                            itemsIndexed(targets) { index, target ->
                                 ModernShareTarget(
                                     target = target,
                                     icon = icons[target],
@@ -393,11 +399,13 @@ internal class ModernMenuOverlayView(
     }
 
     fun scrollByPixels(distance: Int) {
-        val state = scrollState ?: return
-        val next = (state.value + distance).coerceIn(0, state.maxValue)
-        val delta = next - state.value
-        if (delta != 0) {
-            state.dispatchRawDelta(delta.toFloat())
+        if (distance == 0) {
+            return
+        }
+        val state = listState ?: return
+        val scope = scrollScope ?: return
+        scope.launch {
+            state.scrollBy(distance.toFloat())
         }
     }
 }
@@ -484,6 +492,7 @@ private fun ModernShareTarget(
     visible: Boolean,
     index: Int,
     iconOpacity: Float,
+    showLabel: Boolean = true,
     modifier: Modifier = Modifier,
     onBoundsChanged: (androidx.compose.ui.geometry.Rect) -> Unit,
     onDisposed: () -> Unit,
@@ -491,7 +500,7 @@ private fun ModernShareTarget(
     var itemVisible by remember { mutableStateOf(false) }
     LaunchedEffect(visible) {
         if (visible) {
-            kotlinx.coroutines.delay(index * MODERN_MENU_ITEM_STAGGER_MS)
+            kotlinx.coroutines.delay(minOf(index, 8) * MODERN_MENU_ITEM_STAGGER_MS)
             itemVisible = true
         } else {
             itemVisible = false
@@ -564,19 +573,21 @@ private fun ModernShareTarget(
                             scaleY = selectedScale
                         },
                 )
-                androidx.compose.material3.Text(
-                    text = target.label?.toString().orEmpty(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 2.dp)
-                        .alpha(iconOpacity),
-                    color = MiuixTheme.colorScheme.onSurfaceContainer,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                )
+                if (showLabel) {
+                    androidx.compose.material3.Text(
+                        text = target.label?.toString().orEmpty(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 2.dp)
+                            .alpha(iconOpacity),
+                        color = MiuixTheme.colorScheme.onSurfaceContainer,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
     }
