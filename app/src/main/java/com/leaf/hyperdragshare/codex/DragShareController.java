@@ -360,7 +360,7 @@ final class DragShareController {
      * otherwise static hold. A subtle periodic pulse on the preview window keeps the drag
      * at the panel's high rate.
      */
-    private static final long BOOST_PULSE_INTERVAL_MS = 500L;
+    private static final long BOOST_PULSE_INTERVAL_MS = 300L;
     private final Runnable boostPulseRunnable = new Runnable() {
         @Override
         public void run() {

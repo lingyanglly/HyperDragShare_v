@@ -50,7 +50,6 @@ final class LongPressGestureDetector {
     private float latestY;
     private float longPressX;
     private float longPressY;
-    private boolean longPressFired;
 
     LongPressGestureDetector(
             long timeoutMillis,
@@ -91,7 +90,6 @@ final class LongPressGestureDetector {
                 downY = y;
                 latestX = x;
                 latestY = y;
-                longPressFired = false;
                 if (callback != null && callback.isLongPressAllowed()) {
                     state = State.PENDING_LONG_PRESS;
                     scheduler.postDelayed(timeoutRunnable, timeoutMillis);
@@ -106,12 +104,6 @@ final class LongPressGestureDetector {
                         && distanceSquared(x, y, downX, downY) > touchSlop * touchSlop) {
                     scheduler.removeCallbacks(timeoutRunnable);
                     state = State.IGNORED_UNTIL_UP;
-                } else if (state == State.CAPTURING_CONTENT && !longPressFired
-                        && distanceSquared(x, y, longPressX, longPressY) > touchSlop * touchSlop) {
-                    // The long press completed (stationary hold); only begin capturing once the
-                    // finger actually moves again. A stationary hold must never trigger.
-                    longPressFired = true;
-                    callback.onLongPress(gestureId, longPressX, longPressY);
                 } else if (state == State.DRAGGING && callback != null) {
                     callback.onDrag(action, x, y, eventTime);
                 }
@@ -194,6 +186,18 @@ final class LongPressGestureDetector {
         state = State.CAPTURING_CONTENT;
         longPressX = latestX;
         longPressY = latestY;
+        // Capture starts with the hold itself so the content is ready the moment the finger
+        // moves; the caller decides when it is allowed to become visible.
+        callback.onLongPress(gestureId, longPressX, longPressY);
+    }
+
+    /** The stable point where the long press completed. */
+    synchronized float longPressX() {
+        return longPressX;
+    }
+
+    synchronized float longPressY() {
+        return longPressY;
     }
 
     private void cancelCurrentLocked() {

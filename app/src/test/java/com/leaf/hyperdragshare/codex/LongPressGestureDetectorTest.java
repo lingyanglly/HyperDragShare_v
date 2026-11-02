@@ -15,7 +15,7 @@ import org.robolectric.annotation.Config;
 @Config(manifest = Config.NONE)
 public final class LongPressGestureDetectorTest {
     @Test
-    public void timeoutThenMoveStartsCaptureAndKeepsLatestPointerForDrag() {
+    public void timeoutStartsCaptureAndKeepsLatestPointerForDrag() {
         FakeCallback callback = new FakeCallback();
         FakeScheduler scheduler = new FakeScheduler();
         LongPressGestureDetector detector = new LongPressGestureDetector(
@@ -23,31 +23,17 @@ public final class LongPressGestureDetectorTest {
 
         detector.onPointerEvent(MotionEvent.ACTION_DOWN, 10f, 20f, 0L);
         scheduler.runPending();
-        // A stationary hold alone must not trigger: capture starts only after movement.
-        assertEquals(0, callback.longPressCount);
-        detector.onPointerEvent(MotionEvent.ACTION_MOVE, 30f, 40f, 600L);
         assertEquals(1, callback.longPressCount);
+        // Capture starts with the hold so the content is ready when the finger moves; the
+        // caller decides whether it may become visible yet.
+        assertEquals(10f, detector.longPressX(), 0f);
+        assertEquals(20f, detector.longPressY(), 0f);
         assertTrue(detector.beginDragging(detector.currentGestureId()));
-        detector.onPointerEvent(MotionEvent.ACTION_MOVE, 35f, 45f, 620L);
-        detector.onPointerEvent(MotionEvent.ACTION_UP, 35f, 45f, 640L);
+        detector.onPointerEvent(MotionEvent.ACTION_MOVE, 30f, 40f, 600L);
+        detector.onPointerEvent(MotionEvent.ACTION_UP, 30f, 40f, 620L);
 
         assertEquals(2, callback.dragCount);
         assertEquals(LongPressGestureDetector.State.IDLE, detector.state());
-    }
-
-    @Test
-    public void stationaryHoldNeverFiresLongPress() {
-        FakeCallback callback = new FakeCallback();
-        FakeScheduler scheduler = new FakeScheduler();
-        LongPressGestureDetector detector = new LongPressGestureDetector(
-                500L, 10f, callback, () -> 0L, scheduler);
-
-        detector.onPointerEvent(MotionEvent.ACTION_DOWN, 0f, 0f, 0L);
-        scheduler.runPending();
-        detector.onPointerEvent(MotionEvent.ACTION_UP, 0f, 0f, 600L);
-
-        assertEquals(0, callback.longPressCount);
-        assertTrue(callback.cancelledCount > 0);
     }
 
     @Test

@@ -9,6 +9,19 @@ import org.junit.Test;
 
 public final class GestureMathTest {
     @Test
+    public void movedBeyondRequiresLeavingTheSlop() {
+        // Stationary hold: never counts as a move.
+        assertFalse(GestureMath.movedBeyond(500f, 800f, 500f, 800f, 22f));
+        // Jitter inside the slop still counts as stationary.
+        assertFalse(GestureMath.movedBeyond(500f, 800f, 510f, 810f, 22f));
+        // A real move in any direction arms the gesture.
+        assertTrue(GestureMath.movedBeyond(500f, 800f, 500f, 830f, 22f));
+        assertTrue(GestureMath.movedBeyond(500f, 800f, 470f, 800f, 22f));
+        // Zero slop accepts the smallest movement.
+        assertTrue(GestureMath.movedBeyond(100f, 100f, 101f, 100f, 0f));
+    }
+
+    @Test
     public void menuTriggersAndActivationMovementRespectDirection() {
         assertFalse(GestureMath.shouldShowMenu(799, 800));
         assertTrue(GestureMath.shouldShowMenu(800, 800));

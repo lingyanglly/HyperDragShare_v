@@ -194,6 +194,9 @@ final class ModernOverlayWindow {
         if (decorView == null) {
             return;
         }
+        // Re-assert the frame-rate vote: the display mode director aggregates votes, so a
+        // foreground app voting 60 Hz between pulses would otherwise drop the drag to 60.
+        DisplayRefreshRate.applySurfaceVote(decorView, overlayView.getContext());
         final int generation = animationGeneration;
         decorView.animate().cancel();
         decorView.animate()

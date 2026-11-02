@@ -102,6 +102,14 @@ final class GestureMath {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    /** {@code true} once the pointer left the anchor by more than {@code slop}. */
+    static boolean movedBeyond(float anchorX, float anchorY, float x, float y, float slop) {
+        float dx = x - anchorX;
+        float dy = y - anchorY;
+        float limit = Math.max(0f, slop);
+        return dx * dx + dy * dy > limit * limit;
+    }
+
     static int previewLeft(float pointerX, int previewWidth, int screenWidth, int margin) {
         return clamp(
                 Math.round(pointerX - previewWidth / 2f),

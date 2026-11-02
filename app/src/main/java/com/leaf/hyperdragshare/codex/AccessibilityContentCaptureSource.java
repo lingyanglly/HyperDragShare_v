@@ -35,9 +35,12 @@ final class AccessibilityContentCaptureSource {
         this.screenshotter = screenshotter;
         ViewConfiguration configuration = ViewConfiguration.get(service);
         DragShareSettings settings = DragShareSettings.readLocal(service);
+        // A scrolling finger must cancel the hold, and a small move must start the drag. The
+        // old 2x+16dp tolerance made slow scrolls pass as long presses and delayed the drag
+        // start until the finger had travelled a long way.
         float tolerantTouchSlop = Math.max(
-                configuration.getScaledTouchSlop() * 2f,
-                service.getResources().getDisplayMetrics().density * 16f)
+                configuration.getScaledTouchSlop(),
+                service.getResources().getDisplayMetrics().density * 8f)
                 * settings.accessibilityTouchSlopMultiplier();
         this.gestureDetector = new LongPressGestureDetector(
                 settings.resolveAccessibilityLongPressTimeoutMillis(
@@ -86,6 +89,10 @@ final class AccessibilityContentCaptureSource {
                 && after == LongPressGestureDetector.State.IGNORED_UNTIL_UP) {
             service.trace("gesture=" + gestureDetector.currentGestureId()
                     + " rejected movement point=" + Math.round(x) + "," + Math.round(y));
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            flushDeferredShowIfMoved(x, y);
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            discardDeferredShow();
         }
     }
 
@@ -96,6 +103,14 @@ final class AccessibilityContentCaptureSource {
     }
 
     private static final long COMBINED_PORTAL_WINDOW_MS = 1_500L;
+
+    /** The content is captured with the hold; it becomes visible only after this much move. */
+    private static final float SHOW_MOVE_SLOP_DP = 8f;
+    private final Object deferredShowLock = new Object();
+    private CapturedContent deferredShowContent;
+    private long deferredShowGestureId;
+    private float deferredShowAnchorX;
+    private float deferredShowAnchorY;
 
     private void captureAt(long gestureId, float stableX, float stableY, boolean retried) {
         try {
@@ -213,6 +228,73 @@ final class AccessibilityContentCaptureSource {
             recycleIfOwned(content);
             return;
         }
+        // Capture already ran with the hold, so nothing delays the reveal except the rule that
+        // a stationary hold must never open the share menu. Wait for a small finger move.
+        float anchorX = gestureDetector.longPressX();
+        float anchorY = gestureDetector.longPressY();
+        if (!GestureMath.movedBeyond(
+                anchorX,
+                anchorY,
+                gestureDetector.latestX(),
+                gestureDetector.latestY(),
+                dp(SHOW_MOVE_SLOP_DP))) {
+            synchronized (deferredShowLock) {
+                recycleIfOwned(deferredShowContent);
+                deferredShowContent = content;
+                deferredShowGestureId = gestureId;
+                deferredShowAnchorX = anchorX;
+                deferredShowAnchorY = anchorY;
+            }
+            DragShareLog.i(TAG, "gesture=" + gestureId
+                    + " content captured; waiting for the finger to move");
+            service.trace("gesture=" + gestureId + " show deferred until movement");
+            return;
+        }
+        doShowCapturedContent(gestureId, content);
+    }
+
+    private void flushDeferredShowIfMoved(float x, float y) {
+        CapturedContent pending;
+        long gestureId;
+        synchronized (deferredShowLock) {
+            if (deferredShowContent == null
+                    || !GestureMath.movedBeyond(
+                            deferredShowAnchorX,
+                            deferredShowAnchorY,
+                            x,
+                            y,
+                            dp(SHOW_MOVE_SLOP_DP))) {
+                return;
+            }
+            pending = deferredShowContent;
+            gestureId = deferredShowGestureId;
+            deferredShowContent = null;
+            deferredShowGestureId = 0L;
+        }
+        CapturedContent content = pending;
+        long id = gestureId;
+        DragShareLog.i(TAG, "gesture=" + id + " finger moved; showing captured content");
+        mainHandler.post(() -> doShowCapturedContent(id, content));
+    }
+
+    private void discardDeferredShow() {
+        CapturedContent pending;
+        synchronized (deferredShowLock) {
+            pending = deferredShowContent;
+            deferredShowContent = null;
+            deferredShowGestureId = 0L;
+        }
+        if (pending != null) {
+            DragShareLog.i(TAG, "gesture released without movement; captured content dropped");
+            recycleIfOwned(pending);
+        }
+    }
+
+    private float dp(float value) {
+        return service.getResources().getDisplayMetrics().density * value;
+    }
+
+    private void doShowCapturedContent(long gestureId, CapturedContent content) {
         DragShareSettings settings = DragShareSettings.readLocal(service);
         if (settings.isCombinedCaptureMode()) {
             // One overlay only: hand the captured content to the portal process, which owns

@@ -2,7 +2,7 @@
 
 HyperDragShare 是一个 Android LSPosed 模块，为 HyperOS 传送门的文字和图片长按提供同一手势内的跟手预览与分享菜单。
 
-> **修改说明**：本仓库是 [`Leaf-lsgtky/HyperDragShare`](https://github.com/Leaf-lsgtky/HyperDragShare) 的修改版本（修改日期：2026-11，当前版本 `1.15.0`）。新增与修改内容见 [`docs/ROOT_HELPER_NEXT.md`](docs/ROOT_HELPER_NEXT.md) 中 1.8.0 起的记录；许可证保持 `GPL-3.0-only` 不变，见 [LICENSE](LICENSE)。
+> **修改说明**：本仓库是 [`Leaf-lsgtky/HyperDragShare`](https://github.com/Leaf-lsgtky/HyperDragShare) 的修改版本（修改日期：2026-11，当前版本 `1.15.1`）。新增与修改内容见 [`docs/ROOT_HELPER_NEXT.md`](docs/ROOT_HELPER_NEXT.md) 中 1.8.0 起的记录；许可证保持 `GPL-3.0-only` 不变，见 [LICENSE](LICENSE)。
 
 ## 功能
 

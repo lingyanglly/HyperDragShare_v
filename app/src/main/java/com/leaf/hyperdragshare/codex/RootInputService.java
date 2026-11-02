@@ -179,17 +179,25 @@ public final class RootInputService extends Service {
      */
     private void ensureAccessibilityServiceEnabled() {
         Thread thread = new Thread(() -> {
-            String component = ACCESSIBILITY_COMPONENT;
+            // The system stores this service either as "pkg/.Service" or with the fully
+            // qualified class, so dedupe by package instead of comparing one exact string;
+            // otherwise every start appends another entry to the setting.
             String script =
                     "cur=$(settings get secure enabled_accessibility_services); "
-                            + "case \":$cur:\" in "
-                            + "*\":" + component + ":\"*) ;; "
-                            + "*) if [ -z \"$cur\" ] || [ \"$cur\" = \"null\" ]; then "
-                            + "cur=\"" + component + "\"; "
-                            + "else cur=\"$cur:" + component + "\"; fi ;; "
+                            + "[ \"$cur\" = \"null\" ] && cur=\"\"; "
+                            + "out=\"\"; "
+                            + "oldifs=$IFS; IFS=:; "
+                            + "for e in $cur; do "
+                            + "case \"$e\" in "
+                            + "com.leaf.hyperdragshare.codex/*) continue ;; "
                             + "esac; "
-                            + "settings put secure enabled_accessibility_services \"$cur\"; "
-                            + "settings put secure accessibility_enabled 1; echo \"$cur\"";
+                            + "if [ -z \"$out\" ]; then out=\"$e\"; else out=\"$out:$e\"; fi; "
+                            + "done; "
+                            + "IFS=$oldifs; "
+                            + "if [ -z \"$out\" ]; then out=\"" + ACCESSIBILITY_COMPONENT + "\"; "
+                            + "else out=\"$out:" + ACCESSIBILITY_COMPONENT + "\"; fi; "
+                            + "settings put secure enabled_accessibility_services \"$out\"; "
+                            + "settings put secure accessibility_enabled 1; echo \"$out\"";
             runRootCommand(script, "enable accessibility service");
         }, "drag-share-enable-accessibility");
         thread.setDaemon(true);
