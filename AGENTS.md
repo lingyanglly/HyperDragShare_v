@@ -9,7 +9,7 @@
 ## 工程基线
 
 - 工程类型：Android LSPosed 模块，Java/Kotlin 17，minSdk 33，targetSdk 34，compileSdk 37。
-- 当前版本：`1.15.0`，`versionCode 114`。
+- 当前版本：`1.15.28`，`versionCode 142`。
 - 已验证宿主：传送门 `4.2.1` 与 `5.1.5`（`50015`，Android 17 / HyperOS 4.0），包名
   `com.miui.contentextension`。5.1.5 只完成 DEX 静态符号核对（含
   `observe_control_event` 的 `257`/`258` 字符串），实机注入与拖拽仍须以 logcat 证据为准。
@@ -118,7 +118,7 @@
 .\gradlew.bat testDebugUnitTest lintDebug assembleDebug
 ```
 
-当前应有 83 个单元测试通过，APK 输出到
+当前应有 84 个单元测试通过，APK 输出到
 `app\build\outputs\apk\debug\app-debug.apk`。交付新的可安装行为时同步递增
 `versionCode` 和 `versionName`；纯文档修改不要求增版。
 

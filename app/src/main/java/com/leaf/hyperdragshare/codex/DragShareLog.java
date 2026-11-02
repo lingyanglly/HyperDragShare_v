@@ -46,6 +46,7 @@ final class DragShareLog {
 
     private static volatile int configuredLevel = DragShareSettings.DEFAULT_LOG_LEVEL;
     private static volatile int configuredDestination = DragShareSettings.DEFAULT_LOG_DESTINATION;
+    private static volatile boolean diagnosticsForced;
     private static boolean fileDrainScheduled;
     private static boolean rotateOnNextOpen;
     private static int droppedFileLines;
@@ -55,6 +56,11 @@ final class DragShareLog {
 
     static void configure(DragShareSettings settings) {
         if (settings == null) {
+            return;
+        }
+        if (diagnosticsForced) {
+            // A diagnostics broadcast already switched this process to logcat; re-applying the
+            // saved settings would silence it again mid-investigation.
             return;
         }
         int nextLevel = settings.logLevel;
@@ -74,6 +80,23 @@ final class DragShareLog {
 
     static boolean isDebugEnabled() {
         return configuredLevel == DragShareSettings.LOG_LEVEL_DEBUG;
+    }
+
+    /**
+     * Temporary diagnostic hook used by the ISLAND_PROBE/DIAGNOSTIC_DUMP broadcasts: forces
+     * INFO logging to logcat so a connected adb shell can see what the runtime did, regardless
+     * of the configured destination.
+     */
+    static void enableTemporaryDiagnostics() {
+        diagnosticsForced = true;
+        configuredLevel = DragShareSettings.LOG_LEVEL_INFO;
+        if (configuredDestination == DragShareSettings.LOG_DESTINATION_FILE) {
+            synchronized (FILE_LOCK) {
+                PENDING_FILE_LINES.clear();
+            }
+            FILE_EXECUTOR.execute(DragShareLog::closeFileSink);
+        }
+        configuredDestination = DragShareSettings.LOG_DESTINATION_SYSTEM;
     }
 
     static int configuredDestination() {

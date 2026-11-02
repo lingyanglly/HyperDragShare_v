@@ -38,7 +38,14 @@ public final class DragShareAccessibilityService extends AccessibilityService {
     public static final String ACTION_PORTAL_PICK =
             "com.leaf.hyperdragshare.codex.PORTAL_PICK";
     public static final String EXTRA_PORTAL_PICK_IMAGE = "image";
-    /** Accessibility content handed to the portal process for its single overlay. */
+    /** Diagnostic broadcasts that post / cancel the armed island without a gesture. */
+    public static final String ACTION_ISLAND_PROBE =
+            "com.leaf.hyperdragshare.codex.ISLAND_PROBE";
+    public static final String ACTION_ISLAND_PROBE_OFF =
+            "com.leaf.hyperdragshare.codex.ISLAND_PROBE_OFF";
+    /** Diagnostic broadcast that publishes the root-only log file where adb can read it. */
+    public static final String ACTION_LOG_COPY =
+            "com.leaf.hyperdragshare.codex.LOG_COPY";    /** Accessibility content handed to the portal process for its single overlay. */
     public static final String ACTION_ACCESSIBILITY_CONTENT =
             "com.leaf.hyperdragshare.codex.ACCESSIBILITY_CONTENT";
     private static final String DIAG_TAG = "DragShare/Diag";
@@ -612,13 +619,44 @@ public final class DragShareAccessibilityService extends AccessibilityService {
         diagnosticReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                if (intent != null && ACTION_DIAGNOSTIC_DUMP.equals(intent.getAction())) {
+                if (intent == null) {
+                    return;
+                }
+                if (ACTION_DIAGNOSTIC_DUMP.equals(intent.getAction())) {
+                    DragShareLog.enableTemporaryDiagnostics();
                     DragShareLog.i(DIAG_TAG, "diagnostic dump requested");
                     dumpWindowTreeForDiagnostics();
+                } else if (ACTION_ISLAND_PROBE.equals(intent.getAction())) {
+                    DragShareLog.enableTemporaryDiagnostics();
+                    String override = intent.getStringExtra("param");
+                    DragShareLog.i(DIAG_TAG, "island probe: show override=" + (override != null));
+                    if (override != null && !override.isEmpty()) {
+                        DragReadyIsland.show(DragShareAccessibilityService.this, override);
+                    } else {
+                        DragReadyIsland.show(DragShareAccessibilityService.this);
+                    }
+                } else if (ACTION_ISLAND_PROBE_OFF.equals(intent.getAction())) {
+                    DragShareLog.i(DIAG_TAG, "island probe: dismiss");
+                    DragReadyIsland.dismiss(DragShareAccessibilityService.this);
+                } else if (ACTION_LOG_COPY.equals(intent.getAction())) {
+                    DragShareLog.enableTemporaryDiagnostics();
+                    copyDiagnosticLogForAdb();
+                } else if (DragReadyIsland.ACTION_ISLAND_BRIDGE.equals(intent.getAction())) {
+                    boolean visible = intent.getBooleanExtra(
+                            DragReadyIsland.EXTRA_ISLAND_VISIBLE, false);
+                    if (visible) {
+                        DragReadyIsland.show(DragShareAccessibilityService.this);
+                    } else {
+                        DragReadyIsland.dismiss(DragShareAccessibilityService.this);
+                    }
                 }
             }
         };
         IntentFilter filter = new IntentFilter(ACTION_DIAGNOSTIC_DUMP);
+        filter.addAction(ACTION_ISLAND_PROBE);
+        filter.addAction(ACTION_ISLAND_PROBE_OFF);
+        filter.addAction(ACTION_LOG_COPY);
+        filter.addAction(DragReadyIsland.ACTION_ISLAND_BRIDGE);
         try {
             ContextCompat.registerReceiver(
                     this,
@@ -630,8 +668,20 @@ public final class DragShareAccessibilityService extends AccessibilityService {
         }
     }
 
-    private void unregisterDiagnosticReceiver() {
-        if (diagnosticReceiver == null) {
+    /** Temporary diagnostic helper: publish the root-only log where adb shell can read it. */
+    private void copyDiagnosticLogForAdb() {
+        final String target = "/storage/emulated/0/Download/hds.log";
+        Thread worker = new Thread(() -> {
+            boolean copied = RootShell.run(
+                    "cat " + DragShareLog.LOG_FILE_PATH + " > " + target
+                            + "; chmod 644 " + target);
+            DragShareLog.i(DIAG_TAG, "diagnostic log copy to " + target + " ok=" + copied);
+        }, "hds-log-copy");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void unregisterDiagnosticReceiver() {        if (diagnosticReceiver == null) {
             return;
         }
         try {

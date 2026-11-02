@@ -10,6 +10,7 @@ public final class DragShareApplication extends Application {
         super.onCreate();
         DragShareLog.configure(DragShareSettings.readLocal(this));
         DragShareDiagnostics.captureRuntimeOnce(this, "module application created", null);
+        new Thread(RefreshRateOverride::restoreStale, "hds-refresh-restore").start();
         TextSegmenter.preloadIfEnabled(this);
         startRootHelperIfEnabled();
     }

@@ -3,6 +3,7 @@ package com.leaf.hyperdragshare.codex;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.os.Bundle;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -209,6 +210,15 @@ final class DragShareController {
      *  outside its edge when it appeared; require a deliberate outward move and a short
      *  settle window so the first option stays reachable. */
     private static final long MENU_SCROLL_SETTLE_MS = 800L;
+    /**
+     * Relay: the preview is what follows the finger, so it must start the instant the reveal
+     * happens; any artificial hold reads as a stutter. Only the menu trails it.
+     */
+    private static final long RELAY_PREVIEW_ENTER_DELAY_MS = 0L;
+    private static final float RELAY_PREVIEW_ENTER_SCALE = 0.82f;
+    private static final float RELAY_MENU_ENTER_SCALE = 0.92f;
+    private static final long RELAY_MENU_ENTER_DELAY_MS = 90L;
+    private static final float CAPSULE_ENTER_SCALE = 0.94f;
     private static final int MENU_SCROLL_ARM_SLOP_DP = 24;
     private long menuShownUptime;
     private float menuShownX;
@@ -244,6 +254,38 @@ final class DragShareController {
     private int previewWidth;
     private int previewHeight;
     private boolean modernPreviewEnterStarted;
+    /** Set once the armed reminder timed out; the rest of that press is ignored. */
+    private boolean reminderExpired;
+    /**
+     * Set when this press has asked for the system island reminder. The share window may only
+     * appear for a press that showed the reminder first, so a press that never armed one (or a
+     * content hand-off that raced the whole hold) cannot paint a window out of nowhere.
+     */
+    private boolean reminderArmed;
+    private long reminderArmedUptime;
+    /** Minimum time the island stays alone on screen before the window takes over. */
+    private static final long ISLAND_LEAD_MS = 120L;
+    /** Minimum time the island must stay alone on screen before the window replaces it. */
+    /**
+     * Time the island must stay readable *after* it is actually on screen
+     * ({@link DragReadyIsland#onScreenUptime()}); before that the reminder is still on its way
+     * up and covering it would defeat the whole point of the reminder.
+     */
+    private static final long ISLAND_MIN_VISIBLE_MS = 180L;
+    /** How long the window may wait for the island to actually appear before giving up. */
+    private static final long REMINDER_WAIT_MS = 400L;
+    private static final long REMINDER_RETRY_MS = 60L;
+    private boolean menuEnterAnimated;
+    /** When the last window for a press actually went up; used to collapse double shows. */
+    private long overlayShownUptime;
+    /**
+     * The portal's own pick and the accessibility hand-off both report the same physical press.
+     * Whichever paints first wins; a hand-off arriving inside this window would otherwise tear
+     * that window down and rebuild it, which the user sees as the menu flickering.
+     */
+    private static final long HANDOFF_DEDUPE_MS = 1_200L;
+    /** The finger left the slop while no island was on screen yet: this drag is dropped. */
+    private boolean movedBeforeIsland;
     // Keep an exiting preview addressable until its animation completes so a new drag can
     // tear it down immediately instead of briefly stacking two overlay windows.
     private int previewExitGeneration;
@@ -327,7 +369,8 @@ final class DragShareController {
         this.backgroundTouchBlocker = new BackgroundTouchBlocker(context);
         this.windowPolicy = windowPolicy == null ? OverlayWindowPolicy.systemHosted() : windowPolicy;
         this.dragShareToast = new DragShareToast(context, this.windowPolicy);
-        this.gestureMoveSlopPx = context.getResources().getDisplayMetrics().density * 24f;
+        this.gestureMoveSlopPx = context.getResources().getDisplayMetrics().density
+                * GestureMath.DRAG_SHOW_SLOP_DP;
     }
 
     boolean isActive() {
@@ -407,6 +450,18 @@ final class DragShareController {
         }
         final long requestId = ++showRequestId;
         runOnMain(() -> {
+            log("show requested request=" + requestId
+                    + " shifted=" + gestureMovedSinceDown
+                    + " active=" + active
+                    + " defer=" + windowPolicy.deferUntilMove);
+            if (reminderExpired && reminderVisibleUptime() == 0L) {
+                log("overlay skipped: the armed reminder already expired");
+                return;
+            }
+            // Every capture path arms the reminder the moment it has content, which is still
+            // during the hold. Doing it here (instead of only in the deferred branch) means the
+            // island is already up whenever the finger eventually moves.
+            armReminder();
             // Portal long presses often collide with an app's own long-press menu. Only
             // take over once the finger actually moves; a stationary hold is left alone.
             if (windowPolicy.deferUntilMove && !gestureMovedSinceDown) {
@@ -435,14 +490,40 @@ final class DragShareController {
         }
         final long requestId = ++showRequestId;
         runOnMain(() -> {
+            if (reminderExpired && reminderVisibleUptime() == 0L) {
+                log("handoff skipped: the armed reminder already expired");
+                return;
+            }
+            if (SystemClock.uptimeMillis() - overlayShownUptime < HANDOFF_DEDUPE_MS) {
+                // This press already produced a window; painting another one would tear the
+                // first down and look like the menu flashed away and came back.
+                log("handoff skipped: this press already opened a window");
+                return;
+            }
             rootInputProven = true;
             gestureMovedSinceDown = true;
+            // The accessibility runtime only hands content over mid-gesture; if its own reminder
+            // is already up this is a no-op, otherwise arm it so the window still has a lead-in.
+            armReminder();
             showOnMain(content, initialX, initialY, loadedSettings, requestId);
         });
     }
 
     void cancelActiveSession() {
         runOnMain(this::cancelGestureOnMain);
+    }
+
+    /**
+     * The armed reminder expired in the module process: the press is dead, so a late content
+     * hand-off must not paint a window the user can no longer dismiss.
+     */
+    void onReminderExpired() {
+        runOnMain(() -> {
+            reminderExpired = true;
+            reminderArmed = false;
+            reminderArmedUptime = 0L;
+            cancelGestureOnMain();
+        });
     }
 
     float latestPointerX() {
@@ -513,7 +594,10 @@ final class DragShareController {
                     CapturedContent payload = pendingMoveShowPayload;
                     DragShareSettings ps = pendingMoveShowSettings;
                     long pr = pendingMoveShowRequestId;
-                    clearPendingMoveShow();
+                    // Only the payload is consumed here: the island must stay up (and stay
+                    // "armed") until the window actually takes over, otherwise the very gate
+                    // that requires a reminder would reject the reveal we are starting.
+                    clearPendingPayload();
                     log("overlay shown after the finger moved");
                     // Appear directly under the current finger so the triggering move does
                     // not also yank the freshly created window away from the long-press point.
@@ -539,20 +623,104 @@ final class DragShareController {
             gestureDownX = x;
             gestureDownY = y;
             gestureMovedSinceDown = false;
+            reminderExpired = false;
+            reminderArmed = false;
+            reminderArmedUptime = 0L;
+            movedBeforeIsland = false;
         } else if (action == MotionEvent.ACTION_MOVE && !gestureMovedSinceDown) {
             float dx = x - gestureDownX;
             float dy = y - gestureDownY;
             if (dx * dx + dy * dy > gestureMoveSlopPx * gestureMoveSlopPx) {
                 gestureMovedSinceDown = true;
+                // reminderVisibleUptime() is RPC-aware, so this also works from the portal
+                // process where the notification is posted by the module.
+                long reminderUptime = reminderVisibleUptime();
+                long onScreenUptime = reminderUptime == 0L
+                        ? 0L
+                        : reminderUptime + DragReadyIsland.RENDER_LATENCY_MS;
+                if (onScreenUptime == 0L
+                        || SystemClock.uptimeMillis() < onScreenUptime) {
+                    // Dragging before the reminder is up means the user never saw it, so this
+                    // gesture is a plain long-press drag and must not open anything.
+                    movedBeforeIsland = true;
+                    log("finger moved before the reminder appeared; this drag is dropped");
+                }
             }
         }
     }
 
     private void clearPendingMoveShow() {
+        DragReadyIsland.request(context, false);
+        reminderArmed = false;
+        reminderArmedUptime = 0L;
+        clearPendingPayload();
+        pendingPortalHostFloatWindowSuppression = false;
+    }
+
+    /** Drops the deferred payload without touching the reminder state. */
+    private void clearPendingPayload() {
         pendingMoveShowPayload = null;
         pendingMoveShowSettings = null;
         pendingMoveShowRequestId = 0L;
-        pendingPortalHostFloatWindowSuppression = false;
+    }
+
+    /**
+     * Arms the island reminder for the current press. The notification is owned by the module
+     * process, so this only asks for it (or updates it) and never stacks a second one.
+     */
+    private void armReminder() {
+        reminderArmed = true;
+        // The accessibility runtime may have posted the same reminder already (it arms it the
+        // moment it has content). Re-posting then restarts SystemUI's island animation and
+        // pushes the gate back to zero, so reuse whatever is already on screen.
+        long visibleUptime = reminderVisibleUptime();
+        if (visibleUptime != 0L) {
+            if (reminderArmedUptime == 0L || visibleUptime < reminderArmedUptime) {
+                reminderArmedUptime = visibleUptime;
+            }
+            return;
+        }
+        if (reminderArmedUptime == 0L) {
+            reminderArmedUptime = SystemClock.uptimeMillis();
+        }
+        DragReadyIsland.setExpiryListener(this::onReminderExpired);
+        DragReadyIsland.request(context, true);
+    }
+
+    /**
+     * Whether the reminder is really on screen. Asking the module process (instead of trusting
+     * our own request) is what makes "no island, no window" true even when the notification is
+     * blocked or the request never reached the module.
+     */
+    private long reminderVisibleUptime() {
+        if (DragReadyIsland.MODULE_PACKAGE.equals(context.getPackageName())) {
+            return DragReadyIsland.postedUptime();
+        }
+        try {
+            Bundle answer = context.getContentResolver().call(
+                    ImageStagingClient.BASE_URI,
+                    DragReadyIsland.METHOD_IS_POSTED,
+                    null,
+                    null);
+            if (answer == null || !answer.getBoolean(DragReadyIsland.EXTRA_POSTED, false)) {
+                return 0L;
+            }
+            return answer.getLong(DragReadyIsland.EXTRA_POSTED_UPTIME, 0L);
+        } catch (Throwable error) {
+            log("unable to read the reminder state: " + error);
+            return 0L;
+        }
+    }
+
+    /** Called by the accessibility runtime, which arms the same reminder in this process. */
+    void noteReminderArmed() {
+        // Capture runs off the main thread, so hop onto it before touching the gesture state.
+        runOnMain(() -> {
+            reminderArmed = true;
+            if (reminderArmedUptime == 0L) {
+                reminderArmedUptime = SystemClock.uptimeMillis();
+            }
+        });
     }
 
     /** Called by a root-backed source after it has created an active drag session. */
@@ -620,6 +788,73 @@ final class DragShareController {
             log("overlay start superseded by a newer request");
             return;
         }
+        long reminderUptime = reminderVisibleUptime();
+        if (reminderUptime == 0L) {
+            long waited = SystemClock.uptimeMillis() - reminderArmedUptime;
+            if (reminderArmed && waited < REMINDER_WAIT_MS) {
+                // The island was requested but the module process may still be posting it (or
+                // the broadcast is waking that process). Give it a moment instead of painting a
+                // window with nothing behind it.
+                log("overlay waits for the reminder to appear");
+                mainHandler.postDelayed(
+                        () -> showOnMain(payload, requestedInitialX, requestedInitialY,
+                                loadedSettings, requestId),
+                        REMINDER_RETRY_MS);
+                return;
+            }
+            // Nothing has reminded the user that this press can be dragged, so painting a
+            // window here would look like it came from nowhere. This is the single gate every
+            // capture path shares: portal pick, accessibility hand-off and accessibility-local.
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay skipped: the reminder never appeared for this gesture");
+            return;
+        }
+        if (movedBeforeIsland) {
+            // The finger left the slop before the reminder was on screen, so this drag never
+            // had a visible invitation and must be treated as abandoned.
+            DragReadyIsland.request(context, false);
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay skipped: the finger moved before the reminder appeared");
+            return;
+        }
+        long onScreenUptime = reminderUptime + DragReadyIsland.RENDER_LATENCY_MS;
+        long reminderVisibleFor = SystemClock.uptimeMillis() - onScreenUptime;
+        if (reminderVisibleFor < ISLAND_MIN_VISIBLE_MS) {
+            // A press that turns into a drag within a few dozen milliseconds would otherwise
+            // replace the island with the window before the user ever saw it.
+            long remaining = ISLAND_MIN_VISIBLE_MS - reminderVisibleFor;
+            log("overlay waits " + remaining + "ms so the reminder is actually seen");
+            mainHandler.postDelayed(
+                    () -> showOnMain(payload, requestedInitialX, requestedInitialY,
+                            loadedSettings, requestId),
+                    remaining);
+            return;
+        }
+        long islandLeadLeft = ISLAND_LEAD_MS - (SystemClock.uptimeMillis() - reminderArmedUptime);
+        if (islandLeadLeft > 0L) {
+            // Content can arrive after the finger already moved (slow captures). Give the
+            // island a moment alone on screen instead of replacing it in the same frame, so
+            // the hand-over stays readable no matter when the content shows up.
+            log("overlay waits " + islandLeadLeft + "ms for the reminder to be seen");
+            mainHandler.postDelayed(
+                    () -> showOnMain(payload, requestedInitialX, requestedInitialY,
+                            loadedSettings, requestId),
+                    islandLeadLeft);
+            return;
+        }
+        // The overlay takes over from the armed reminder, whatever the outcome below.
+        DragReadyIsland.request(context, false);
+        if ((lastObservedAction == MotionEvent.ACTION_UP
+                        || lastObservedAction == MotionEvent.ACTION_CANCEL)
+                && SystemClock.uptimeMillis() - lastPointerUptime <= SESSION_STALL_TIMEOUT_MS) {
+            // The content can arrive after the finger is gone (slow capture, or a handoff
+            // that crossed the release). Painting now would leave a preview nobody can drag
+            // or commit, which only clears when the stall watchdog fires. The freshness
+            // window keeps a dead input stream from forbidding every later gesture.
+            pendingPortalHostFloatWindowSuppression = false;
+            log("overlay skipped: gesture ended before the overlay started");
+            return;
+        }
         if (deferredShowPending && deferredShowRequestId != requestId) {
             clearDeferredShow();
         }
@@ -649,6 +884,9 @@ final class DragShareController {
         }
         if (active) {
             pendingPortalHostFloatWindowSuppression = false;
+            // The window is already up for this press: re-assert the rate boost because a
+            // cancelled portal session can have released it a moment ago.
+            startBoostPulse();
             if (!duplicateStartLogged) {
                 duplicateStartLogged = true;
                 log("duplicate Taplus start ignored during active drag");
@@ -696,6 +934,7 @@ final class DragShareController {
                 windowManager.addView(previewView, previewParams);
             }
             active = true;
+            overlayShownUptime = SystemClock.uptimeMillis();
             pendingPortalHostFloatWindowSuppression = false;
             startBoostPulse();
             registerNearHandSensorIfNeeded();
@@ -1200,12 +1439,22 @@ final class DragShareController {
         }
         modernPreviewEnterStarted = true;
         if (modernPreviewWindow != null) {
-            modernPreviewWindow.showAnimated();
+            modernPreviewWindow.showAnimated(
+                    RELAY_PREVIEW_ENTER_SCALE, RELAY_PREVIEW_ENTER_DELAY_MS);
         } else {
             preview.showAnimated();
         }
     }
+
+    private long takeMenuEnterDelayMs() {
+        if (menuEnterAnimated) {
+            return 0L;
+        }
+        menuEnterAnimated = true;
+        return RELAY_PREVIEW_ENTER_DELAY_MS + RELAY_MENU_ENTER_DELAY_MS;
+    }
     private void createMenu() {
+        menuEnterAnimated = false;
         if (shareTargets.isEmpty()) {
             // The async target query may still be running. Never build an empty menu:
             // an empty window would flash its placeholder text over the host app.
@@ -1706,7 +1955,18 @@ final class DragShareController {
         }
         menuView.animate().cancel();
         menuView.setAlpha(0f);
-        menuView.animate().alpha(1f).setDuration(150L).start();
+        // Same relay idea as the modern windows, in miniature: the capsule grows out instead of
+        // blinking on, and it starts a beat after the preview so the eye follows one sequence.
+        menuView.setScaleX(CAPSULE_ENTER_SCALE);
+        menuView.setScaleY(CAPSULE_ENTER_SCALE);
+        menuView.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setStartDelay(RELAY_MENU_ENTER_DELAY_MS)
+                .setDuration(170L)
+                .setInterpolator(new DecelerateInterpolator(1.6f))
+                .start();
     }
 
     private boolean shouldShowSimpleMenu(float x, float y) {
@@ -2001,7 +2261,8 @@ final class DragShareController {
             menuShown = true;
             fadeInCapsuleIfNeeded();
             if (modernMenuWindow != null) {
-                modernMenuWindow.showAnimated();
+                // Already on screen: re-asserting the window must not replay the entrance.
+                modernMenuWindow.showAnimated(1f, 0L);
             } else {
                 modernMenuView.showAnimated();
             }
@@ -2012,7 +2273,7 @@ final class DragShareController {
         }
         try {
             if (isModernStyle() && modernMenuWindow != null) {
-                modernMenuWindow.showAnimated();
+                modernMenuWindow.showAnimated(RELAY_MENU_ENTER_SCALE, takeMenuEnterDelayMs());
             } else {
                 windowManager.addView(menuView, menuParams);
             }
@@ -2201,7 +2462,6 @@ final class DragShareController {
             log("background scroll lock skipped because root input was not active");
         }
         active = false;
-        stopBoostPulse();
         stopEdgeScroll();
         backgroundTouchBlocker.stop();
         if (afterDeactivate != null) {
@@ -2229,11 +2489,13 @@ final class DragShareController {
     private void cancelGestureOnMain() {
         mainHandler.removeCallbacks(stuckSessionCheck);
         mainHandler.removeCallbacks(sessionHardLimit);
+        DragReadyIsland.request(context, false);
+        reminderArmed = false;
+        reminderArmedUptime = 0L;
         if (!active) {
             return;
         }
         active = false;
-        stopBoostPulse();
         stopEdgeScroll();
         backgroundTouchBlocker.stop();
         removeGestureViews(true);
@@ -2545,14 +2807,19 @@ final class DragShareController {
 
     private void startBoostPulse() {
         mainHandler.removeCallbacks(boostPulseRunnable);
+        // The panel's rate cap is a system setting on HyperOS, so it has to be raised for the
+        // duration of the gesture; the window/surface votes alone cannot lift it.
+        RefreshRateOverride.acquire(context);
         mainHandler.postDelayed(boostPulseRunnable, BOOST_PULSE_INTERVAL_MS);
     }
 
     private void stopBoostPulse() {
         mainHandler.removeCallbacks(boostPulseRunnable);
+        RefreshRateOverride.release();
     }
 
     private void pulseBoost() {
+        RefreshRateOverride.keepAlive(context);
         ModernOverlayWindow modernWindow = modernPreviewWindow;
         if (modernWindow != null) {
             modernWindow.pulseBoost();

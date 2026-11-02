@@ -433,6 +433,356 @@ helper 进程被杀后 `START_STICKY` 会自愈，因此“回落”分支难以
 
 单测维持 82 全绿（删除项同步更新测试引用），lint 通过。交付 `hds-1.11.0.apk`。
 
+## 1.15.27 / versionCode 141：拖动全程高帧 + 松手后一定回落 + 一次按压只开一次窗
+
+【修复】`refresh cap` 中途被还原、松手后又不回落。
+- 现象：`DragShare/Refresh` 日志里 `refresh cap 60Hz -> 120Hz` 之后只过了 337ms 就
+  `restored to 60Hz`，整段拖动仍然是 60Hz；另一种情况是松手很久后 `miui_refresh_rate`
+  仍是 120。
+- 成因一：`DragShareController.finishGestureOnMain()` / `cancelGestureOnMain()` 各自调用
+  `stopBoostPulse()`，而传送门为同一次按压开窗时会先收到 `control=257` 收尾，于是镜头还在
+  拖就已经把提频放掉了。改法：这两个方法不再停脉冲，只有真正移除浮窗的
+  `removeGestureViews()` 才 `stopBoostPulse()`；`showOnMain()` 命中“本按压已有窗口”的重复
+  分支时重新 `startBoostPulse()`，把被上一次收尾放掉的提频补回来。
+- 成因二（松手后仍高刷）：`RefreshRateOverride.release()` 原来在 `savedValue == null` 时
+  直接 `rm -f` marker 并且**不写回设置**；一旦某次 acquire 读到“已经是峰值”或进程中途死掉，
+  原始 60Hz 就永久丢失，面板被钉在 120Hz。改法：marker 文件成为唯一权威——
+  `acquire()` 先读 marker，存在就以它为准重新提频；`release()` 先按 marker 还原再删 marker；
+  `active == false` 时的迟到 release 也走 `restoreFromMarker()`。
+- 成因三（保险）：`keepAlive()` 每次提频顺带 `touch` marker 作为心跳；新增
+  `RefreshRateOverride.recoverIfStale(long staleAfterMs)`，由常驻的 `RootInputService`
+  守护线程每 2s 检查 marker 的 mtime，超过 4s 没有心跳就还原并删除（覆盖“传送门进程中途被杀”
+  和“上一个进程没来得及 release”）。另加 `MAX_HOLD_MS = 15_000L` 硬上限，任何异常都不会让
+  面板一直停在峰值。
+
+【修复】分享菜单“出现 → 消失 → 出现”。
+- 成因：同一次按压既有传送门自己的 pick，又有无障碍的移交，两边都走到
+  `DragShareController.showOnMain()`；后到的窗口会把先到的拆掉重建（日志里两对
+  `requested overlay frame rate=120.00001` 相隔 1.5s）。同时无障碍侧
+  `AccessibilityContentCaptureSource` 会对同一个 gesture 移交两次，第二次在传送门里
+  `armReminder()` 把已经被撤掉的岛重新发出来，看着就是岛闪一下。
+- 改法：① `AccessibilityContentCaptureSource` 新增 `handedOffGestureId`，同一 gesture 第二次
+  进入组合模式移交分支时直接丢弃（`already handed off; duplicate content dropped`）；
+  ② `DragShareController` 新增 `overlayShownUptime` 与 `HANDOFF_DEDUPE_MS = 1_200L`，
+  `showFromHandoff()` 在 1.2s 内已经开过窗就跳过（`handoff skipped: this press already opened
+  a window`）。
+
+【记录】帧率上限的取证：`dumpsys SurfaceFlinger` 的
+`displayManagerPolicy={appRequestRanges={render=[0.00, 60.00]}}` 说明 HyperOS 会把
+`secure miui_refresh_rate` 当作窗口请求的硬上限，`preferredDisplayModeId` 和
+`SurfaceControl.setFrameRate` 都突破不了，只有改这个 secure 设置有效；`miui_refresh_rate`
+还会被系统按前台应用覆写（B 站前台时是 60，桌面是 120），所以必须靠心跳维持。
+
+单测 84 全绿，`bash tools/deploy_local.sh` 交付 `hds-1.15.27.apk`。
+
+## 1.15.28 / versionCode 142：提频改成后台线程，窗口不再被 su 卡掉
+
+【修复】1.15.27 上"岛正常出现，但预览和分享菜单根本不出现"。
+- 成因：`RefreshRateOverride` 的每个 `RootShell` 调用（`su` exec）都跑在调用线程上，
+  而 `stopBoostPulse()` 挂在 `removeGestureViews()` 里，`showOnMain()` 建窗前一定会走到
+  它；`release()` 在无 marker 时还要 `readFile` 一次（超时 3s）。于是主线程被 `su` 往返
+  占住，建窗被推迟到手指抬起之后，表现为"这一按压完全没有窗口"。
+- 改法：新增单线程守护池 `WORKER`（线程名 `hds-refresh`），`acquire` / `release` /
+  `keepAlive` 只入队，实现拆到 `acquireNow` / `releaseNow` / `keepAliveNow`；
+  `acquireQueued` 防重复入队，`keepAlive` 加 900ms 提交去抖。
+- 验证（用户真手指，`test28.log` / `test28c.log`）：`overlay shown after the finger moved`
+  → `menu shown pointerY=1299 menuTop=72` + `preview shown kind=IMAGE targets=67 ... at=369,1299`；
+  重复移交被 `handoff skipped: this press already opened a window` 拦住。
+
+【记录】`content handed to portal kind=IMAGE` 在同一毫秒出现两次，是同一句被
+`DragShareLog.i` 与 `service.trace` 各打一遍，不是真的移交了两次。
+
+【记录】帧率：`Overlay` 层相邻两帧间隔约 8.3ms（≈120Hz），
+`00:57:40.0–41.0` 232 帧、`41.0–41.9` 214 帧；`miui_refresh_rate` 被旧版本钉在 120 时
+`acquireNow` 走 `currentHz >= peak` 分支不写 marker，`release()` 也无从还原，
+只能靠 `recoverIfStale` / `restoreStale` 或系统覆写回 60。
+
+单测 84 全绿，`bash tools/deploy_local.sh` 交付 `hds-1.15.28.apk`。
+
+## 1.15.23 / versionCode 137：预览入场对齐到真正的第一帧（去掉开场卡顿）
+
+- 【现象】用户反馈「预览出现有点卡顿」。
+- 【根因】`ModernOverlayWindow.showAnimated()` 原来在 `dialog.show()` 之后**立刻**启动
+  220ms 的 scale/alpha 动画。窗口的 addView、Compose 首次组合、首次 measure/layout 和
+  合成器的背景模糊都落在同一帧上，第一帧往往要 60–120ms 才出来，于是动画已经走到中段
+  才第一次可见 —— 观感就是「卡一下再弹出」。
+- 【实现】改为等真正的第一帧：`show()` 之后注册 `ViewTreeObserver.OnPreDrawListener`，
+  在 onPreDraw 里才 `setAlpha(0)` / `setScale(fromScale)` 并启动动画，使动画 t=0 与首个
+  可见帧对齐；同时加 `postDelayed(..., FIRST_FRAME_WAIT_ALLOWANCE_MS + 80L)` 兜底，避免
+  窗口完全不出帧时停在不可见状态。等待超过 24ms 会记录
+  `enter animation waited <n>ms for the first frame`。
+- 【实现】`overlayView.setContentVisibleForWindowAnimation(true)` 从 `show()` 之后移到之前，
+  避免把 Compose 的重组排到本该平滑的第一帧上。
+- 【实现】`pulseBoost()` 的门限 `enterAnimationUntilUptime` 在等待期也保持有效
+  （`+ FIRST_FRAME_WAIT_ALLOWANCE_MS = 140L`），不会在等待第一帧时取消入场动画。
+- 单测维持 84 全绿。交付 `hds-1.15.23.apk`。
+
+## 1.15.22 / versionCode 136：岛出现之前就拖动 = 放弃本次手势（改成状态机，不是计时）
+
+- 【需求】用户要求的是因果顺序，不是等待时长：**岛必须已经出现在屏幕上**才允许拖动出预览与
+  菜单；在那之前手指就已经拖动，整笔手势视为放弃。
+- 【实现】`DragReadyIsland.RENDER_LATENCY_MS = 420L` 与 `static long onScreenUptime()`
+  （`posted` 为真时返回 `postedUptime + RENDER_LATENCY_MS`，否则 0）。
+- 【实现】`DragShareController` 新增 `private boolean movedBeforeIsland`：`trackGestureOnMain()`
+  在移动超过 `gestureMoveSlopPx` 时读取 `reminderVisibleUptime()`（RPC 感知，传送门进程也正确），
+  若 `onScreenUptime == 0` 或当前时间早于它，置位并打印
+  `finger moved before the reminder appeared; this drag is dropped`；`ACTION_DOWN` 复位。
+- 【实现】`showOnMain()` 在岛可见性检查之后新增：`movedBeforeIsland` 为真则撤岛并
+  `overlay skipped: the finger moved before the reminder appeared` 返回。
+- 【实现】`AccessibilityContentCaptureSource.flushDeferredShowIfMoved()` 同样判断
+  `SystemClock.uptimeMillis() < DragReadyIsland.onScreenUptime()`，为真则
+  `recycleIfOwned` + 撤岛 + `gestureDetector.captureFailed(id)` + 日志
+  `moved before the reminder appeared; content dropped`。
+- 【说明】`ISLAND_MIN_VISIBLE_MS` 回到 180L，但计时起点从 `notify()` 改为
+  `onScreenUptime()`（notify + 420ms 渲染延迟），因此既保证岛真的上屏过，又不会让窗口
+  无谓地等 700ms。
+- 单测维持 84 全绿。交付 `hds-1.15.22.apk`。
+
+## 1.15.21 / versionCode 135：岛至少被看见 230ms 才允许窗口接管（700ms 下限）
+
+- 【问题】460ms 只够覆盖 notify → `addDynamicIslandView` 的上界，岛刚露头就被预览窗盖住。
+- 【修复】`DragShareController.ISLAND_MIN_VISIBLE_MS` 460L → 700L（约 470ms 上屏 + 230ms 可读）。
+- 单测维持 84 全绿。交付 `hds-1.15.21.apk`。
+
+## 1.15.20 / versionCode 134：窗口必须等岛真正画出来（460ms 下限）
+
+- 【问题】`ISLAND_MIN_VISIBLE_MS` 原为 180ms，而它计的是 `notify()` 之后的时长；实测 notify →
+  SystemUI `addDynamicIslandView` 需要 340–470ms，于是手指一动、窗口就先把岛盖掉了（"直接拖也会
+  出预览和分享框，岛还没出来"）。
+- 【修复】`DragShareController.ISLAND_MIN_VISIBLE_MS` 180L → 460L，覆盖实测上界；窗口只可能在岛
+  真实上屏之后绘制。
+- 单测维持 84 全绿。交付 `hds-1.15.20.apk`。
+
+## 1.15.19 / versionCode 133：按压前重设主机任务标志 + 陈旧会话自清 + 按压取证日志
+
+- 【问题】连续长按时只有第一次有效：被模块接管的拖拽会让 Taplus 的"任务已完成"标志停在
+  false，而它只在标志为 true 时才启动下一次 pick —— 后续按压连 pick 都不再发生（无岛、无窗）。
+- 【修复】`PortalHooks.dispatchRootPointer()` 在 `ACTION_DOWN` 调 `resetHostTaskForNewPress()`
+  （每次按压只调一次 `setIsTaskFinished(true)`），`ACTION_UP`/`ACTION_CANCEL` 复位去重标志。
+- 【修复】同一个方法在 `ACTION_DOWN` 检查上一笔会话：`controller.isActive()` 且距上一帧
+  `> 2000ms` 就 `cancelActiveSession()` 并清空延迟队列 —— 否则主机 pick 调用会被永久延迟，
+  `hasReadyRootSource()` 判真时表现为"第一下能用，之后全哑"。
+- 【新增日志】`press start active=<bool> deferred=<n> readyRoot=<bool> idle=<n>ms`、
+  `cancelling stale drag session idle=<n>ms before the new press`。
+- 【取证结论】`adb shell input` 注入的触摸**不经过内核 evdev**，因此我们的 root 触摸流看不到它，
+  它只会经 MIUI motion 通道进入传送门。所以本模块的 root 路径只能由真手指验证，合成手势仅能
+  验证框架层回调；此前"注入坐标与日志 point 对不上"也是这个原因，不是坐标映射缺陷。
+- 单测维持 84 全绿，lint 通过。交付 `hds-1.15.19.apk`。
+
+## 1.15.15 / versionCode 129：同一按压只发一次岛（不再重发导致缩小）
+
+- 【问题】组合模式下传送门与无障碍会为同一次按压各请求一次岛；第二次 `notify` 同一 id 会让
+  SystemUI 播放更新/收缩动画，并把 `postedUptime` 重置，180ms 计时重新开始，于是出现"岛刚出现
+  就缩小"、"再拖动没有预览和菜单"。
+- 【修复】`DragReadyIsland.show()` 记录 `lastParamJson`，已显示且 JSON 相同时只刷新 6s 生命
+  周期（日志 `island already visible; lifetime refreshed`），不再重发通知；`dismiss()` 清空该记录。
+- 【修复】`DragShareController` 的过期判定改为 `reminderExpired ## 1.15.13 / versionCode 127：岛至少停留 180ms，才允许窗口接管## 1.15.13 / versionCode 127：岛至少停留 180ms，才允许窗口接管 reminderVisibleUptime() == 0L`：
+  岛此刻就在屏幕上时，"上次已过期"的结论不能套用到这次按压。
+
+## 1.15.13 / versionCode 127：岛至少停留 180ms，才允许窗口接管
+
+- 【问题】1.15.11 已经把"岛真的在屏幕上"变成门槛，但门槛只回答"现在可见吗"。手指在长按
+  成立后几十毫秒内就开始拖动时，岛刚发出去就被窗口顶掉，用户看到的是"没看见岛就出菜单"。
+- 【修复】`DragReadyIsland` 记录 `postedUptime`（`SystemClock.uptimeMillis()`，两进程同一时基），
+  通过 Provider RPC 的 `EXTRA_POSTED_UPTIME` 回传给传送门；`DragShareController.showOnMain()`
+  要求岛**已可见满 `ISLAND_MIN_VISIBLE_MS = 180ms`**，不足则 `postDelayed` 补足剩余时间，
+  日志 `overlay waits <n>ms so the reminder is actually seen`。
+- 【同版】岛请求从广播改为 Provider 直呼：`DragReadyIsland.request()` 在非模块进程时先
+  `ContentResolver.call(BASE_URI, METHOD_SET_VISIBLE, ...)`（同步、可按需拉起模块进程、不受后台
+  广播限制），失败才退回 `ACTION_ISLAND_BRIDGE` 广播；`IslandBridgeReceiver` 仍保留作为冷启动
+  兜底。
+- 行为总结：长按成立 → 岛出现 → 手指移动超过 20dp → 岛至少再留到满 180ms → 撤岛 → 预览入场
+  → 90ms 后菜单长出。岛始终没出现则**本次手势不开窗**（`overlay skipped: the reminder never
+  appeared for this gesture`）。
+
+单测 84 全绿（新增逻辑不涉单测路径）。交付 `hds-1.15.13.apk`。
+
+## 1.15.11 / versionCode 125：岛真的出现了，才放行窗口（跨进程状态查询 + 常驻接收器）
+
+- 【根因】1.15.10 的门槛只代表"本进程已经**请求**上岛"，不代表岛真的在屏幕上。两个断点都会
+  让请求凭空消失：
+  1. 岛的通知属于模块进程，传送门只能广播请求；而 `ACTION_ISLAND_BRIDGE` 的接收器原来只注册
+     在 `DragShareAccessibilityService` 里——纯传送门模式（或无障碍被系统停掉）时该服务没跑，
+     广播无人接收，岛从未出现，但传送门自己的 `reminderArmed` 已置位，于是照常出窗。
+  2. `DragReadyIsland.show()` 内部失败（通知被拦、进程被杀）只写一行日志，调用方无感。
+- 【修复】新增 manifest 声明的 `IslandBridgeReceiver`（`android:exported="true"`，只认
+  `com.leaf.hyperdragshare.codex.ISLAND`）：进程没起来时广播也能冷启动模块进程并把岛发出来。
+- 【修复】新增状态回查：`DragReadyIsland.isPosted()` + Provider RPC
+  `DragReadyIsland.METHOD_IS_POSTED = "island_posted"`（`ShareImageProvider.call`，
+  `enforcePortalCaller()` 允许本 UID 与传送门）。`DragShareController.isReminderOnScreen()`
+  在本进程直接读静态量、在传送门进程走这次 RPC。
+- 【门槛】`showOnMain()` 改成查**真实可见性**：不可见时最多等 `REMINDER_WAIT_MS = 400ms`
+  （每 `REMINDER_RETRY_MS = 60ms` 重试一次，覆盖"广播唤醒冷进程"的延迟），仍不可见就
+  `log("overlay skipped: the reminder never appeared for this gesture")` 并放弃开窗。
+- 【安全】该接收器 `exported` 只做"显示/隐藏一条自己的通知"，不读数据、不写设置；日志记
+  `bridge request visible=` 便于核对。
+
+单测 84 全绿。交付 `hds-1.15.11.apk`。
+
+## 1.15.10 / versionCode 124：先有岛，才允许出窗口（提醒成为唯一前置条件）
+
+- 【行为】用户要求的顺序是"岛先出现，手指再拖动才触发分享"；此前只是"两条链路各自决定是否
+  发岛"，岛与窗口之间没有因果关系，所以会看到"岛没出现也能直接拖出菜单"。
+- 【实现】`DragShareController` 新增 `reminderArmed` / `reminderArmedUptime` 与
+  `armReminder()`：`show()`（传送门自己 pick，含延后分支之前）和 `showFromHandoff()`（无障碍
+  移交）进入主线程的第一件事都是 `armReminder()`，它注册 `setExpiryListener` 并通过
+  `DragReadyIsland.request(context, true)` 请求岛（岛是模块进程里的同一条通知，重复请求只更新）。
+  无障碍本地模式在 `captureAt()` 上岛后补一行 `controller.noteReminderArmed()`（跨线程，
+  走 `runOnMain`），让同进程的控制器知道这次按压已经有岛。
+- 【门槛】`showOnMain()` 在 `requestId` 检查之后、任何绘制之前判断 `reminderArmed`：为假就
+  `log("overlay skipped: the reminder was never armed for this gesture")` 并返回。三条入口
+  （`show()` / `showFromHandoff()` / 无障碍本地 `show()`）共用这一道门，因此"没有岛就没有
+  菜单"是结构保证，而不是各分支各自的巧合。
+- 【时序】新增 `ISLAND_LEAD_MS = 120L`：若岛是刚刚才被 arm 的（内容在手指已经移动后才回来，
+  慢抓取/跨进程移交），窗口最多等剩余的那段时间再绘制，避免"同一帧里岛被窗口顶掉"；正常路径
+  （长按期间就已 arm）这笔等待为 0，因此不会给跟手增加延迟。
+- 【撤岛】`clearPendingMoveShow()` 现在拆成两层：手指移动真正开窗时只调 `clearPendingPayload()`
+  （保留岛与 `reminderArmed`，否则会被自己的门挡回去），`ACTION_UP`/`CANCEL` 以及
+  `cancelGestureOnMain()`、`onReminderExpired()` 才撤岛并清 `reminderArmed`。
+
+单测 84 全绿。交付 `hds-1.15.10.apk`。
+
+## 1.15.9 / versionCode 123：岛在、菜单不来的那条分支删掉（无障碍不再让位给传送门）
+
+- 【修复】用户报告"岛出现了，但继续拖动没有分享菜单和预览"。根因是组合模式里无障碍侧的
+  `postShowIfPortalSilent()`：只要 1.5s 内见过一次传送门 pick（`isPortalPickRecent(1500)`），
+  它就把自己刚抓到的内容 `recycle` 掉、只调 `gestureDetector.captureFailed()` 收场，赌"传送门
+  会替这次手势开窗"。赌输的两种情形都会留下"只有岛": ① 那次 pick 属于上一次手势（连续长按时
+  很常见）；② 传送门确实 pick 了，但它没抓到内容/被 `reminderExpired` 之类拒掉。于是岛亮着，
+  手指怎么拖都没有窗口。
+- 【修复】该方法改名 `handOffFoundContent(gestureId, content)`，删掉 `isCombinedCaptureMode()`
+  与 `isPortalPickRecent()` 两个条件，**无条件**把内容交给共享窗口。去重不靠"让位"，靠传送门
+  `DragShareController.showOnMain()` 自己的两道守卫：`requestId != showRequestId` 丢弃过期请求、
+  `active` 时忽略重复 start —— 谁最后到谁说了算，窗口永远只有一个。顺带删掉只服务于该分支的
+  `COMBINED_PORTAL_WINDOW_MS`。
+- 【约束】菜单入口始终只有 `DragShareController.showOnMain()` 一条（传送门自己 pick 的走
+  `show()`，无障碍移交的走 `showFromHandoff()`，两者最终都落到它），岛只是旁路提示，不在
+  任何一条路径上做"先出岛才有菜单"的判断。
+
+单测 84 全绿。交付 `hds-1.15.9.apk`。
+
+## 1.15.8 / versionCode 122：补上"有拖放却没岛"的那条链路；岛过期就作废手势
+
+- 【修复】组合模式 + B 站长按文字（封面标题/简介这类"传送门能抓、无障碍会跳过"的内容）时
+  两条链路互相以为对方会发岛：无障碍的 `captureAt()` 只在 `!hookedApp || selection.isImage()`
+  时发岛（B 站文字不满足），传送门的 `show()` 延后分支又被
+  `!loadedSettings.isAccessibilityCaptureMode()` 挡住 → 拖放照常触发但全程没有岛。现在
+  传送门无条件 `DragReadyIsland.request(context, true)`：岛是模块进程里的**同一条通知**，
+  两条链路各自请求只会更新它，不会叠成两个。
+- 【行为】岛的生命周期上限恢复 **6s**（上一版临时调到 12s）。到期后：模块进程撤岛，并通过
+  `com.leaf.hyperdragshare.codex.ISLAND_EXPIRED` 广播通知传送门进程；传送门
+  `DragShareController.onReminderExpired()` 置 `reminderExpired` 并 `cancelGestureOnMain()`，
+  `show()` / `showFromHandoff()` 都会拒绝再开窗，`trackGestureOnMain` 在下一次 ACTION_DOWN
+  时复位。语义：**提醒过期＝这次不分享**，之后怎么动都不出菜单。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.8.apk`。
+
+## 1.15.7 / versionCode 121：去掉接力延迟；岛过期即取消本次手势
+
+- 【修复】1.15.6 给预览窗加的 160ms"等岛收起"的延迟，实际观感是窗口突然闪出来、跟手
+  断了一拍。现在预览窗在揭示瞬间就开始入场（`RELAY_PREVIEW_ENTER_DELAY_MS = 0`），只有
+  菜单仍延后 `RELAY_MENU_ENTER_DELAY_MS = 90ms`，"预览先出、菜单后跟"的层次靠这 90ms
+  维持，不再有空洞。
+- 【行为】岛的生命周期上限（12s）到期时，本次手势一并作废：`DragReadyIsland` 新增
+  `setExpiryListener(Runnable)`，`EXPIRE` 里撤岛后回调；无障碍侧注册 `this::cancel`
+  （取消长按检测器、关闭会话），传送门侧注册 `this::cancelGestureOnMain`。此后即使手指
+  继续移动也不会再弹分享菜单，符合"提醒过期就等于这次不分享"的语义。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.7.apk`。
+
+## 1.15.6 / versionCode 120：岛先收、窗口后到（真正的先后关系）
+
+- 【修复】1.15.5 的接力只是"同时开始动"：岛由系统撤销、收起动画约 200ms，而窗口的放大
+  淡入立刻开始，观感上就是"岛还没收，菜单已经压上来了"。1.15.6 曾把预览入场延后
+  `RELAY_ISLAND_HANDOFF_MS=160ms`，但实测反而显得窗口"闪"出来，已在 1.15.7 撤回为 0。
+- 【修复】岛的生命周期上限 `MAX_LIFETIME_MS` 6s → **12s**：长按保持超过 6 秒时岛会自己
+  消失，看起来就像"这次没有岛"。
+- 【说明】`pulseBoost()` 在入场窗口内只重申刷新率投票，不再打断入场动画；入场窗口现在
+  包含这段延迟。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.6.apk`。
+
+## 1.15.5 / versionCode 119：岛 → 窗口接力过渡；岛统一由模块进程持有
+
+- 【修复】"有时候没有岛"的第二个成因：组合模式下岛由模块进程发出，而菜单由传送门进程
+  显示，`DragShareController` 里用传送门的 context 调 `NotificationManager.cancel(1001)`
+  撤不掉我们自己的通知（跨进程 cancel 无效），岛只能等 6s 兜底；同时无障碍侧在传送门
+  接管时又主动撤岛，导致整次手势一个岛都没有。
+- 【修复】岛改为单一持有者：新增 `DragReadyIsland.request(Context, boolean)`，进程号是
+  模块自己就本地 `show/dismiss`，否则广播 `com.leaf.hyperdragshare.codex.ISLAND`
+  + extra `visible`，由 `DragShareAccessibilityService` 的诊断接收器在模块进程里执行。
+  `DragShareController` 的四处调用（`show()` 延后分支、`clearPendingMoveShow`、
+  `cancelGestureOnMain`、`showOnMain`）全部改走 `request()`。
+- 【修复】交接期间不再提前撤岛：`flushDeferredShowIfMoved`、`postShowIfPortalSilent`
+  和 `doShowCapturedContent` 的组合模式分支都保留岛，直到传送门窗口真正出现（它自己
+  通过 `request(context,false)` 撤）；`discardDeferredShow` 则改为**手势结束无条件撤岛**，
+  保证岛不会活得比手指久。
+- 【优化】接力过渡：`ModernOverlayWindow.showAnimated(float initialScale, long
+  startDelayMs)` 新增入场参数；预览从 `RELAY_PREVIEW_ENTER_SCALE=0.82f` 放大淡入，菜单
+  从 `RELAY_MENU_ENTER_SCALE=0.92f` 且延后 `RELAY_MENU_ENTER_DELAY_MS=90ms` 长出，胶囊
+  菜单同样 `CAPSULE_ENTER_SCALE=0.94f` + 90ms 延迟；`pulseBoost()` 在入场动画结束前
+  只重申刷新率投票、不再 `cancel()` 动画（否则入场会被脉冲打断成一跳）。
+- 【说明】"分享菜单整体搬进超级岛"经逆向判定不可行（展开态才有自定义 RemoteViews、
+  准入需 SystemUI 内置白名单、岛收不到拖拽 hover/drop），细节见
+  `tmp-island/REPORT-island.md`；因此改为"岛 → 窗口"的接力视觉。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.5.apk`。
+
+## 1.15.4 / versionCode 118：把"已就绪"提醒提前到候选命中时刻
+
+- 【修复】1.15.3 的岛是在"内容抓取完成、确认要延迟显示"之后才发，而纯图提取在
+  `tv.danmaku.bili` 里要走一次 root 往返（实测长按到抓完约 450–520ms）。手指动得快时
+  内容抓完时手指早就过了 20dp，代码直接走"立即显示"分支，岛根本不发 → 现象就是
+  "有时候有、有时候没有"。现在候选一命中就在 `captureAt()` 里先发岛
+  （`!hookedApp || selection.isImage()` 时），不等抓取。
+- 【修复】抓取失败/被跳过（`candidate missing`、`sharing disabled`、B 站文字容器跳过、
+  截屏失败、传送门已接管）这些"最终没有内容"的路径都会撤岛，避免提前发的岛留在屏幕上。
+- 【说明】B 站里长按**文字**是刻意跳过的（`no ImageView and no image region; skipping`，
+  站点自己的长按菜单不属于可拖拽内容），所以那种情况不会上岛也不会出菜单，属预期。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.4.apk`。
+
+## 1.15.3 / versionCode 117：未移动时上超级岛提醒 + 20dp 揭示阈值
+
+- 【新增】`DragReadyIsland`：长按已就绪、手指还没移动时，发一条普通通知并把 JSON 塞进
+  `miui.focus.param`，HyperOS 会把它渲染成"超级岛"迷你胶囊（图标 + 「拖动即可分享」）。
+  实测要点：`param_v2` 里**不要**给 `param_island`（给了就必须同时给合法的
+  `bigIslandArea.imageTextInfoLeft.type=1|5`，否则 `IslandParamsException` 直接撤岛），
+  走系统默认岛最稳；`"reopen":"reopen"` 必须显式写，否则同 id 被 cancel 后第二次上岛会静默失败；
+  `manager.cancel(1001)` 会连同岛一起撤掉。
+- 【新增】上岛/撤岛接线：无障碍路径在 `showCapturedContent()` 的"延迟显示"分支上岛，
+  `flushDeferredShowIfMoved()`（移动）/`discardDeferredShow()`（松手）/`doShowCapturedContent()`
+  （开窗）/`cancel()` 撤岛；传送门路径在 `DragShareController.show()` 的 `deferUntilMove`
+  分支上岛（仅组合模式之外由传送门负责，避免双岛），`clearPendingMoveShow()` /
+  `cancelGestureOnMain()` / `showOnMain()` 撤岛。
+- 【修复】抓取比松手更晚结束时，原来会先建"已就绪"岛再也没人撤：现在延迟分支先判
+  `gestureDetector.isCapturing(gestureId)`，无效手势直接丢弃内容；另有 6s 兜底定时撤销
+  （`DragReadyIsland.MAX_LIFETIME_MS`），漏掉 `ACTION_UP` 也不会长期占岛。
+- 【修改】菜单揭示阈值统一到 `GestureMath.DRAG_SHOW_SLOP_DP = 20f`（原 8dp 太灵敏、
+  24dp 只用于传送门），两条捕获路径共用同一数值。
+- 【新增】诊断广播：`ACTION_ISLAND_PROBE` / `ACTION_ISLAND_PROBE_OFF`（可带 `param` 直接覆盖
+  JSON，改文案不必重新编译）、`ACTION_LOG_COPY`（把 root 只读日志复制到
+  `/sdcard/Download/hds.log`），并可在诊断时临时把日志级别提到 INFO 打回 logcat。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.3.apk`。
+
+## 1.15.2 / versionCode 116：快速滑动松手后的残留预览
+
+- 【修复】抓取与移交可能在手指抬起之后才完成，原来照样会开窗：预览停在松手位置，直到
+  `stuckSessionCheck`（约 1.7s）超时才消失。`AccessibilityContentCaptureSource.doShowCapturedContent()`
+  现在先用 `gestureDetector.isCapturing(gestureId)` 判断手势是否还有效，已抬起就直接丢弃内容。
+- 【修复】传送门侧 `DragShareController.showOnMain()` 增加同一语义的守卫：最近一次指针事件是
+  `ACTION_UP` / `ACTION_CANCEL` 时跳过建窗，覆盖"内容比手指晚到"的路径，不再依赖看门狗兜底。
+- 【测试】单测 84 全绿，`assembleRelease` 通过。
+
+交付 `hds-1.15.2.apk`。
+
 ## 1.15.1 / versionCode 115：误触发 / 预览延迟 / 拖拽刷新率
 
 - 【修复】长按位移阈值从 `2×slop+16dp`（实测约 44px）降为标准 `8dp` slop：缓慢滑动时能在

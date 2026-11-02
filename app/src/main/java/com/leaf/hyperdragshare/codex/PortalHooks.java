@@ -270,14 +270,32 @@ final class PortalHooks {
             accessibilityContentReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context receiverContext, Intent intent) {
-                    if (intent != null && DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT
+                    if (intent == null) {
+                        return;
+                    }
+                    if (DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT
                             .equals(intent.getAction())) {
                         handleAccessibilityContent(intent);
+                    } else if (DragShareAccessibilityService.ACTION_DIAGNOSTIC_DUMP
+                            .equals(intent.getAction())) {
+                        // The portal process keeps its own log settings; this is the only way to
+                        // watch the portal-side gesture flow from logcat.
+                        DragShareLog.enableTemporaryDiagnostics();
+                        log("portal diagnostics enabled");
+                    } else if (DragReadyIsland.ACTION_ISLAND_EXPIRED.equals(intent.getAction())) {
+                        // The armed reminder timed out in the module process; this gesture must
+                        // not turn into a share menu any more.
+                        DragShareController current = controller;
+                        if (current != null) {
+                            current.onReminderExpired();
+                        }
                     }
                 }
             };
             IntentFilter filter = new IntentFilter(
                     DragShareAccessibilityService.ACTION_ACCESSIBILITY_CONTENT);
+            filter.addAction(DragReadyIsland.ACTION_ISLAND_EXPIRED);
+            filter.addAction(DragShareAccessibilityService.ACTION_DIAGNOSTIC_DUMP);
             context.registerReceiver(accessibilityContentReceiver, filter,
                     Context.RECEIVER_EXPORTED);
             log("accessibility content receiver registered");
@@ -786,8 +804,43 @@ final class PortalHooks {
         }
     }
 
+    /**
+     * Taplus only starts a pick while its "task finished" flag is true, and a drag taken over by
+     * the module can leave that flag false. Then the first long press works and every following
+     * one produces no pick at all (no island, no window) until the process restarts. Reset the
+     * flag once per press instead of trusting our own takeover to have finished the host task.
+     */
+    private static boolean pressResetPending;
+
+    private static void resetHostTaskForNewPress() {
+        if (pressResetPending) {
+            return;
+        }
+        pressResetPending = true;
+        markHostTaskPickReady();
+    }
+
     private static void dispatchRootPointer(int action, float x, float y, long eventTime) {
-        lastRootEventUptime = SystemClock.uptimeMillis();
+        long now = SystemClock.uptimeMillis();
+        long idleBeforeEvent = now - lastRootEventUptime;
+        lastRootEventUptime = now;
+        if (action == MotionEvent.ACTION_DOWN) {
+            // A session that never saw its ACTION_UP keeps the host's pick calls deferred forever,
+            // which looks like "the first press works and every later one does nothing".
+            DragShareController current = controller;
+            if (current != null && current.isActive() && idleBeforeEvent > 2_000L) {
+                log("cancelling stale drag session idle=" + idleBeforeEvent + "ms before the new press");
+                current.cancelActiveSession();
+                clearDeferredHostCalls();
+            }
+            log("press start active=" + (current != null && current.isActive())
+                    + " deferred=" + deferredHostCallCount()
+                    + " readyRoot=" + hasReadyRootSource()
+                    + " idle=" + idleBeforeEvent + "ms");
+            resetHostTaskForNewPress();
+        } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            pressResetPending = false;
+        }
         if (DragShareLog.isDebugEnabled()) {
             DragShareLog.d(TAG, "root pointer action=" + MotionEvent.actionToString(action)
                     + " point=" + Math.round(x) + "," + Math.round(y)
@@ -817,6 +870,12 @@ final class PortalHooks {
             stopLocalRootSource("helper frames resumed; local evdev stopped");
         }
         dispatchRootPointer(action, x, y, eventTime);
+    }
+
+    private static int deferredHostCallCount() {
+        synchronized (DEFERRED_HOST_LOCK) {
+            return DEFERRED_HOST_CALLS.size();
+        }
     }
 
     private static boolean deferHostCallIfRootDragActive(

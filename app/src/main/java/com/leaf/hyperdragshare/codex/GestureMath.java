@@ -3,6 +3,13 @@ package com.leaf.hyperdragshare.codex;
 final class GestureMath {
     private static final float EDGE_SCROLL_ENTRY_SPEED_MULTIPLIER = 0.2f;
 
+    /**
+     * How far the finger must travel away from the long-press point before the share
+     * overlay may appear. Shared by the portal and accessibility paths so both reveal on
+     * the same gesture distance; a stationary hold never opens it.
+     */
+    static final float DRAG_SHOW_SLOP_DP = 20f;
+
     private GestureMath() {}
 
     static boolean shouldShowMenu(float pointerY, int triggerTop) {

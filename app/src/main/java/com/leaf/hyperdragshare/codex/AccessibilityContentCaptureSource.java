@@ -97,23 +97,40 @@ final class AccessibilityContentCaptureSource {
     }
 
     void cancel() {
+        DragReadyIsland.dismiss(service);
         gestureDetector.cancel();
         screenshotter.cancelAll();
         controller.cancelActiveSession();
     }
 
-    private static final long COMBINED_PORTAL_WINDOW_MS = 1_500L;
-
     /** The content is captured with the hold; it becomes visible only after this much move. */
-    private static final float SHOW_MOVE_SLOP_DP = 8f;
+    private static final float SHOW_MOVE_SLOP_DP = GestureMath.DRAG_SHOW_SLOP_DP;
     private final Object deferredShowLock = new Object();
     private CapturedContent deferredShowContent;
     private long deferredShowGestureId;
     private float deferredShowAnchorX;
     private float deferredShowAnchorY;
+    /**
+     * One hand-off per press. The deferred reveal and a late flush can both reach the reveal
+     * path for the same gesture; the second copy made the portal drop the island the first one
+     * had already taken down and post a fresh one, which is what the user saw as the island
+     * blinking in the middle of a drag.
+     */
+    private long handedOffGestureId;
 
-    private void captureAt(long gestureId, float stableX, float stableY, boolean retried) {
-        try {
+    /**
+     * The reminder belongs to the gesture, not to one capture path. When this path gives up but
+     * the finger is still down, the portal may still be holding the same island for the same
+     * press, so taking it down here made the island "flash and vanish" and then left the share
+     * window blocked by the "no island, no window" rule.
+     */
+    private void dismissReminderUnlessLive(long gestureId) {
+        if (!gestureDetector.isCapturing(gestureId)) {
+            DragReadyIsland.dismiss(service);
+        }
+    }
+
+    private void captureAt(long gestureId, float stableX, float stableY, boolean retried) {        try {
             classifierExecutor.execute(() -> {
                 if (!gestureDetector.isCapturing(gestureId)) {
                     return;
@@ -129,7 +146,10 @@ final class AccessibilityContentCaptureSource {
                                 () -> captureAt(gestureId, stableX, stableY, true),
                                 50L);
                     } else {
-                        mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+                        mainHandler.post(() -> {
+                            dismissReminderUnlessLive(gestureId);
+                            gestureDetector.captureFailed(gestureId);
+                        });
                     }
                     return;
                 }
@@ -137,11 +157,24 @@ final class AccessibilityContentCaptureSource {
                 if (!settings.isAccessibilityCaptureMode()
                         || !settings.isSharingEnabled(selection.isImage())) {
                     service.trace("gesture=" + gestureId + " sharing disabled");
-                    mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+                    mainHandler.post(() -> {
+                        dismissReminderUnlessLive(gestureId);
+                        gestureDetector.captureFailed(gestureId);
+                    });
                     return;
                 }
                 AccessibilityCandidate candidate = selection.candidate;
-                if (ViewDumpClient.supports(candidate.sourcePackage)) {
+                boolean hookedApp = ViewDumpClient.supports(candidate.sourcePackage);
+                if (!hookedApp || selection.isImage()) {
+                    // Arm the reminder as soon as the press is known to be shareable. Waiting for
+                    // the image extraction (a root round trip that costs ~0.5s in the hooked app)
+                    // made the island arrive after the finger had already moved, so it looked
+                    // like the reminder only worked sometimes.
+                    DragReadyIsland.setExpiryListener(this::cancel);
+                    DragReadyIsland.show(service);
+                    controller.noteReminderArmed();
+                }
+                if (hookedApp) {
                     // Ask the injected app first: a real ImageView renders to a pure image.
                     Bitmap pure = ViewDumpClient.request(stableX, stableY);
                     if (pure != null) {
@@ -152,7 +185,7 @@ final class AccessibilityContentCaptureSource {
                                 candidate.sourcePackage,
                                 candidate.bounds,
                                 true);
-                        postShowIfPortalSilent(gestureId, content);
+                        handOffFoundContent(gestureId, content);
                         return;
                     }
                     if (!selection.isImage()) {
@@ -160,7 +193,10 @@ final class AccessibilityContentCaptureSource {
                         // draggable content in this app; never crop or copy them.
                         service.trace("gesture=" + gestureId
                                 + " no ImageView and no image region; skipping");
-                        mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+                        mainHandler.post(() -> {
+                            dismissReminderUnlessLive(gestureId);
+                            gestureDetector.captureFailed(gestureId);
+                        });
                         return;
                     }
                     // Image region without an ImageView (e.g. the video surface): fall through
@@ -172,7 +208,7 @@ final class AccessibilityContentCaptureSource {
                             candidate.text,
                             candidate.sourcePackage,
                             candidate.bounds);
-                    postShowIfPortalSilent(gestureId, content);
+                    handOffFoundContent(gestureId, content);
                     return;
                 }
                 screenshotter.capture(gestureId, candidate.bounds, new AccessibilityScreenshotter.Callback() {
@@ -185,7 +221,7 @@ final class AccessibilityContentCaptureSource {
                                 candidate.sourcePackage,
                                 candidate.bounds,
                                 true);
-                        postShowIfPortalSilent(completedGestureId, content);
+                        handOffFoundContent(completedGestureId, content);
                     }
 
                     @Override
@@ -195,6 +231,7 @@ final class AccessibilityContentCaptureSource {
                                     + " image capture failed", error);
                             service.trace("gesture=" + completedGestureId
                                     + " screenshot failed=" + error.getClass().getSimpleName());
+                            dismissReminderUnlessLive(completedGestureId);
                             gestureDetector.captureFailed(completedGestureId);
                         });
                     }
@@ -202,29 +239,28 @@ final class AccessibilityContentCaptureSource {
             });
         } catch (RuntimeException error) {
             DragShareLog.w(TAG, "gesture=" + gestureId + " classifier unavailable", error);
-            mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
+            mainHandler.post(() -> {
+                dismissReminderUnlessLive(gestureId);
+                gestureDetector.captureFailed(gestureId);
+            });
         }
     }
 
     /**
-     * Combined mode: the content is captured immediately (so an app's own long-press sheet
-     * cannot end up in the crop) and handed off at once. A duplicate portal pick is rejected
-     * by the portal controller's own "already active" guard, so no extra wait is needed.
+     * Hands the freshly captured content to the shared overlay. It used to be dropped whenever a
+     * portal pick had been seen in the last 1.5s, on the assumption that the portal was already
+     * going to paint this gesture. When that assumption was wrong (the portal picked but then
+     * produced no window, or the pick belonged to the previous press) the reminder stayed on
+     * screen with nothing behind it, which is the "island appeared but no menu" report. The
+     * portal controller keeps the newest request, so handing the content over is always safe.
      */
-    private void postShowIfPortalSilent(long gestureId, CapturedContent content) {
-        if (DragShareSettings.readLocal(service).isCombinedCaptureMode()
-                && service.isPortalPickRecent(COMBINED_PORTAL_WINDOW_MS)) {
-            recycleIfOwned(content);
-            DragShareLog.i(TAG, "gesture=" + gestureId
-                    + " portal already active; accessibility content dropped");
-            mainHandler.post(() -> gestureDetector.captureFailed(gestureId));
-            return;
-        }
+    private void handOffFoundContent(long gestureId, CapturedContent content) {
         mainHandler.post(() -> showCapturedContent(gestureId, content));
     }
 
     private void showCapturedContent(long gestureId, CapturedContent content) {
         if (content == null || !service.isAccessibilityCaptureEnabled()) {
+            DragReadyIsland.dismiss(service);
             recycleIfOwned(content);
             return;
         }
@@ -238,12 +274,31 @@ final class AccessibilityContentCaptureSource {
                 gestureDetector.latestX(),
                 gestureDetector.latestY(),
                 dp(SHOW_MOVE_SLOP_DP))) {
+            if (!gestureDetector.isCapturing(gestureId)) {
+                // The capture finished after the finger was already up, so no ACTION_UP will
+                // ever arrive to arm-then-dismiss the reminder; this content must be dropped
+                // instead of deferred (that is what left the island on screen indefinitely).
+                recycleIfOwned(content);
+                DragShareLog.i(TAG, "gesture=" + gestureId
+                        + " released before arming; content dropped");
+                service.trace("gesture=" + gestureId + " released before arming; content dropped");
+                return;
+            }
             synchronized (deferredShowLock) {
                 recycleIfOwned(deferredShowContent);
                 deferredShowContent = content;
                 deferredShowGestureId = gestureId;
                 deferredShowAnchorX = anchorX;
                 deferredShowAnchorY = anchorY;
+            }
+            // The press is armed but nothing will be shown until the finger moves; say so on
+            // the system island instead of leaving the user without any feedback.
+            DragReadyIsland.setExpiryListener(this::cancel);
+            DragReadyIsland.show(service);
+            controller.noteReminderArmed();
+            if (!gestureDetector.isCapturing(gestureId)) {
+                // The release raced the post; do not leave a reminder for a dead gesture.
+                DragReadyIsland.dismiss(service);
             }
             DragShareLog.i(TAG, "gesture=" + gestureId
                     + " content captured; waiting for the finger to move");
@@ -273,6 +328,18 @@ final class AccessibilityContentCaptureSource {
         }
         CapturedContent content = pending;
         long id = gestureId;
+        if (android.os.SystemClock.uptimeMillis() < DragReadyIsland.onScreenUptime()) {
+            // The finger moved while the reminder was still on its way up, so the user never
+            // saw an invitation: treat the whole drag as abandoned.
+            recycleIfOwned(content);
+            DragReadyIsland.dismiss(service);
+            gestureDetector.captureFailed(id);
+            DragShareLog.i(TAG, "gesture=" + id
+                    + " moved before the reminder appeared; content dropped");
+            return;
+        }
+        // The island stays up on purpose: the reveal is a relay, and the overlay dismisses the
+        // reminder the moment it takes the gesture over.
         DragShareLog.i(TAG, "gesture=" + id + " finger moved; showing captured content");
         mainHandler.post(() -> doShowCapturedContent(id, content));
     }
@@ -285,9 +352,12 @@ final class AccessibilityContentCaptureSource {
             deferredShowGestureId = 0L;
         }
         if (pending != null) {
-            DragShareLog.i(TAG, "gesture released without movement; captured content dropped");
             recycleIfOwned(pending);
+            DragShareLog.i(TAG, "gesture released without movement; captured content dropped");
         }
+        // Any gesture end takes the reminder down, whether or not content was still pending:
+        // the island must never outlive the finger.
+        DragReadyIsland.dismiss(service);
     }
 
     private float dp(float value) {
@@ -295,8 +365,25 @@ final class AccessibilityContentCaptureSource {
     }
 
     private void doShowCapturedContent(long gestureId, CapturedContent content) {
+        // A fast slide can finish the capture after the finger is already up. Painting the
+        // overlay then leaves a window nobody can drag or commit, which lingers until a
+        // watchdog fires; drop that late content instead of showing it at all.
+        if (!gestureDetector.isCapturing(gestureId)) {
+            DragReadyIsland.dismiss(service);
+            recycleIfOwned(content);
+            DragShareLog.i(TAG, "gesture=" + gestureId + " released before reveal; content dropped");
+            service.trace("gesture=" + gestureId + " released before reveal; content dropped");
+            return;
+        }
         DragShareSettings settings = DragShareSettings.readLocal(service);
         if (settings.isCombinedCaptureMode()) {
+            if (handedOffGestureId == gestureId) {
+                recycleIfOwned(content);
+                DragShareLog.i(TAG, "gesture=" + gestureId
+                        + " already handed off; duplicate content dropped");
+                return;
+            }
+            handedOffGestureId = gestureId;
             // One overlay only: hand the captured content to the portal process, which owns
             // the single share window and its own drag tracking. This must not depend on the
             // local gesture state, because the capture can finish after the finger is lifted.
@@ -308,6 +395,7 @@ final class AccessibilityContentCaptureSource {
             return;
         }
         if (!gestureDetector.beginDragging(gestureId)) {
+            DragReadyIsland.dismiss(service);
             recycleIfOwned(content);
             return;
         }

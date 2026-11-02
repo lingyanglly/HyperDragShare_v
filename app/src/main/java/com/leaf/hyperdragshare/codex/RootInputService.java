@@ -83,6 +83,8 @@ public final class RootInputService extends Service {
     private static final long REFRESH_OVERRIDE_RESTORE_MS = 2_000L;
     private static final int HEARTBEAT_REQUEST_CODE = 1;
     private static final long HEARTBEAT_INTERVAL_MS = 15 * 60_000L;
+    private static final long REFRESH_WATCHDOG_INTERVAL_MS = 2_000L;
+    private static final long REFRESH_WATCHDOG_STALE_MS = 4_000L;
     /** The module's own accessibility service, granted through root so the user never has to. */
     private static final String ACCESSIBILITY_COMPONENT =
             "com.leaf.hyperdragshare.codex/"
@@ -167,9 +169,24 @@ public final class RootInputService extends Service {
             DragShareLog.i(TAG, "helper started");
         }
         scheduleHeartbeat();
+        startRefreshWatchdog();
         probeRefreshSettings();
         warmPortalIfCold();
         ensureAccessibilityServiceEnabled();
+        ensureNotificationPermission();
+    }
+
+    /**
+     * The armed-drag reminder is a normal notification, so Android 13+ needs the runtime
+     * permission before it can reach the island. Granting it through root keeps the hint
+     * working even when the user never opens the settings screen.
+     */
+    private void ensureNotificationPermission() {
+        Thread thread = new Thread(() -> runRootCommand(
+                "pm grant " + getPackageName() + " android.permission.POST_NOTIFICATIONS",
+                "grant notification permission"), "drag-share-grant-notifications");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     /**
@@ -369,6 +386,30 @@ public final class RootInputService extends Service {
      * seconds. A self-rescheduling wakeup alarm resurrects the service shortly after
      * every death; each start reschedules the next one.
      */
+    /**
+     * A drag raises the panel's refresh cap and lowers it again when it ends. If the portal
+     * process dies in the middle of a drag that release never happens, so this always-on helper
+     * watches the cap marker's heartbeat and puts the original value back.
+     */
+    private void startRefreshWatchdog() {
+        Thread watchdog = new Thread(() -> {
+            while (running) {
+                try {
+                    Thread.sleep(REFRESH_WATCHDOG_INTERVAL_MS);
+                } catch (InterruptedException interrupted) {
+                    return;
+                }
+                try {
+                    RefreshRateOverride.recoverIfStale(REFRESH_WATCHDOG_STALE_MS);
+                } catch (Throwable error) {
+                    DragShareLog.w(TAG, "refresh watchdog failed", error);
+                }
+            }
+        }, "hds-refresh-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
     private void scheduleHeartbeat() {
         if (!RootHelperPrefs.isEnabled(this)) {
             return;

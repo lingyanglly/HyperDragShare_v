@@ -10,6 +10,8 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- The armed-drag reminder is an ordinary notification rendered as a mini island. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <queries>
         <intent>
@@ -53,6 +55,17 @@
                 <!-- Updating the APK makes Android drop the accessibility service; restart the
                      helper so it re-grants it through root without user interaction. -->
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".IslandBridgeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <!-- The portal process owns the gesture but not the island notification, so it
+                     asks this (always-declared) receiver instead of relying on the
+                     accessibility service being alive. -->
+                <action android:name="com.leaf.hyperdragshare.codex.ISLAND" />
             </intent-filter>
         </receiver>
 

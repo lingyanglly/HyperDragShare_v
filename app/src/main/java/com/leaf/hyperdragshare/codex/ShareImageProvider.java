@@ -56,6 +56,32 @@ public final class ShareImageProvider extends ContentProvider {
                     RootHelperPrefs.isEnabled(context));
             return result;
         }
+        if (DragReadyIsland.METHOD_SET_VISIBLE.equals(method)) {
+            // The portal owns the gesture, the module owns the notification (that is the package
+            // HyperOS authorised for focus notifications), so the portal drives it through here.
+            enforcePortalCaller();
+            boolean visible = extras != null
+                    && extras.getBoolean(DragReadyIsland.EXTRA_ISLAND_VISIBLE, false);
+            Context context = contextOrThrow();
+            if (visible) {
+                DragReadyIsland.show(context);
+            } else {
+                DragReadyIsland.dismiss(context);
+            }
+            Bundle result = new Bundle();
+            result.putBoolean(DragReadyIsland.EXTRA_POSTED, DragReadyIsland.isPosted());
+            result.putLong(DragReadyIsland.EXTRA_POSTED_UPTIME, DragReadyIsland.postedUptime());
+            return result;
+        }
+        if (DragReadyIsland.METHOD_IS_POSTED.equals(method)) {
+            // The share window requires the island to be visible first; the portal process can
+            // only ask the module to post it, so it has to ask back whether that worked.
+            enforcePortalCaller();
+            Bundle result = new Bundle();
+            result.putBoolean(DragReadyIsland.EXTRA_POSTED, DragReadyIsland.isPosted());
+            result.putLong(DragReadyIsland.EXTRA_POSTED_UPTIME, DragReadyIsland.postedUptime());
+            return result;
+        }
         if (ImageStagingClient.METHOD_GRANT.equals(method)) {
             enforcePortalCaller();
             return grantImage(extras);

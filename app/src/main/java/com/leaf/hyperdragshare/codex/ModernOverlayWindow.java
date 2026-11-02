@@ -5,9 +5,11 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.SystemClock;
 import android.view.ContextThemeWrapper;
 import android.view.View;
 import android.view.Window;
+import android.view.ViewTreeObserver;
 import android.view.WindowManager;
 import android.view.animation.PathInterpolator;
 
@@ -23,6 +25,8 @@ final class ModernOverlayWindow {
     private static final String TAG = "DragShare/Overlay";
     private static final float CARD_CORNER_RADIUS_DP = 16f;
     private static final long ENTER_DURATION_MS = 220L;
+    /** Rough budget for the window add, Compose composition and first layout. */
+    private static final long FIRST_FRAME_WAIT_ALLOWANCE_MS = 140L;
     private static final float ENTER_INITIAL_SCALE = 0.9f;
     private static final float EXIT_TARGET_SCALE = 0.96f;
     private static final int SURFACE_VOTE_MAX_ATTEMPTS = 8;
@@ -42,6 +46,8 @@ final class ModernOverlayWindow {
     private boolean nativeBackdropBlurEnabled;
     private boolean disposed;
     private int animationGeneration;
+    private long enterAnimationUntilUptime;
+    private boolean enterAnimationStarted;
 
     ModernOverlayWindow(
             Context context,
@@ -121,21 +127,88 @@ final class ModernOverlayWindow {
     }
 
     void showAnimated() {
+        showAnimated(ENTER_INITIAL_SCALE, 0L);
+    }
+
+    /**
+     * Relay entry: the island shrinks away while this window grows in from {@code
+     * initialScale}. A non-zero start delay lets the preview lead and the menu trail it, so the
+     * two windows read as one sequence instead of popping in together.
+     */
+    void showAnimated(float initialScale, long startDelayMs) {
         if (disposed) {
             return;
         }
         animationGeneration++;
-        show();
+        // Flip the Compose state before the window is added: doing it after show() scheduled a
+        // recomposition on the very frame that was supposed to be the first smooth one.
         overlayView.setContentVisibleForWindowAnimation(true);
+        show();
         View decorView = decorView();
         if (decorView == null) {
             return;
         }
+        final float fromScale = initialScale;
+        final long delay = Math.max(0L, startDelayMs);
+        final int generation = animationGeneration;
+        final long requestedUptime = SystemClock.uptimeMillis();
+        enterAnimationStarted = false;
+        decorView.setAlpha(0f);
+        decorView.setScaleX(fromScale);
+        decorView.setScaleY(fromScale);
+        // Keep the pulse boost quiet for the pending wait as well as for the animation itself.
+        enterAnimationUntilUptime = requestedUptime + delay + ENTER_DURATION_MS
+                + FIRST_FRAME_WAIT_ALLOWANCE_MS;
         decorView.animate().cancel();
+        // show() adds the window here, so its first layout, the Compose composition and the
+        // compositor blur pass all land on the very same frame. Starting the animation right away
+        // would spend the first 60-120ms before a single pixel is on screen and then pop in
+        // half-way through, which reads as a stutter. Hold the start scale and start the animation
+        // from the frame that is actually drawn.
+        final View firstFrameView = decorView;
+        firstFrameView.getViewTreeObserver().addOnPreDrawListener(
+                new ViewTreeObserver.OnPreDrawListener() {
+                    @Override
+                    public boolean onPreDraw() {
+                        ViewTreeObserver observer = firstFrameView.getViewTreeObserver();
+                        if (observer.isAlive()) {
+                            observer.removeOnPreDrawListener(this);
+                        }
+                        startEnterAnimation(
+                                firstFrameView, fromScale, delay, generation, requestedUptime);
+                        return true;
+                    }
+                });
+        // Never leave the window invisible if the traversal produces no frame at all.
+        firstFrameView.postDelayed(
+                () -> startEnterAnimation(
+                        firstFrameView, fromScale, delay, generation, requestedUptime),
+                FIRST_FRAME_WAIT_ALLOWANCE_MS + 80L);
+    }
+
+    private void startEnterAnimation(
+            View decorView,
+            float fromScale,
+            long delay,
+            int generation,
+            long requestedUptime) {
+        if (disposed || enterAnimationStarted || generation != animationGeneration) {
+            return;
+        }
+        enterAnimationStarted = true;
+        long waited = SystemClock.uptimeMillis() - requestedUptime;
+        if (waited > 24L) {
+            DragShareLog.i(TAG, "enter animation waited " + waited + "ms for the first frame");
+        }
+        decorView.setAlpha(0f);
+        decorView.setScaleX(fromScale);
+        decorView.setScaleY(fromScale);
+        enterAnimationUntilUptime = SystemClock.uptimeMillis() + delay + ENTER_DURATION_MS;
         decorView.animate()
                 .alpha(1f)
                 .scaleX(1f)
                 .scaleY(1f)
+                .setStartDelay(delay)
                 .setDuration(ENTER_DURATION_MS)
                 .setInterpolator(ENTER_INTERPOLATOR)
                 .start();
@@ -197,6 +270,11 @@ final class ModernOverlayWindow {
         // Re-assert the frame-rate vote: the display mode director aggregates votes, so a
         // foreground app voting 60 Hz between pulses would otherwise drop the drag to 60.
         DisplayRefreshRate.applySurfaceVote(decorView, overlayView.getContext());
+        if (SystemClock.uptimeMillis() < enterAnimationUntilUptime) {
+            // Cancelling the enter animation mid-flight would snap the window to full size and
+            // undo the relay; the vote above keeps the frame rate high meanwhile.
+            return;
+        }
         final int generation = animationGeneration;
         decorView.animate().cancel();
         decorView.animate()
